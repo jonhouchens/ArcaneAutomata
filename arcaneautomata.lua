@@ -1,6 +1,6 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '1.0.0';
+addon.version   = '1.0.1';
 addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
 
 require 'common';
@@ -588,6 +588,35 @@ local function apply_pending_maneuver(pending, actual, now)
             started = now,
         };
     end
+end
+
+local function confirm_maneuver_slot(slot, now)
+    if (state.settings.confirmation_flash and slot ~= nil) then
+        state.confirmation_flash = {
+            slot = slot,
+            started = now,
+        };
+    end
+end
+
+local function apply_immediate_maneuver(element, before_counts, now)
+    local before_total = maneuver_count_total(before_counts);
+    if (before_total < 3) then
+        -- A successful action below the maneuver cap can only add a new
+        -- instance, so there is no replacement ambiguity to reconcile.
+        return record_maneuver(element, false, now);
+    end
+
+    local replace_index = earliest_slot_index();
+    local replaced = replace_index ~= nil and state.slots[replace_index] or nil;
+    if (replaced ~= nil and not replaced.approximate) then
+        -- Exact timers identify the instance the game will replace. Apply the
+        -- successful action immediately and let record_maneuver either refresh
+        -- a matching orb or replace a different element in the same position.
+        return record_maneuver(element, false, now);
+    end
+
+    return nil;
 end
 
 local function reconcile_slots(force)
@@ -2658,11 +2687,18 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 local before_counts = tracked_counts();
                 state.last_action = now;
                 record_overload_chance(element, action.Param);
-                state.pending_sync = {
-                    element = element,
-                    before_counts = before_counts,
-                    seen = now,
-                };
+                local immediate_slot = apply_immediate_maneuver(
+                    element, before_counts, now);
+                if (immediate_slot ~= nil) then
+                    state.pending_sync = nil;
+                    confirm_maneuver_slot(immediate_slot, now);
+                else
+                    state.pending_sync = {
+                        element = element,
+                        before_counts = before_counts,
+                        seen = now,
+                    };
+                end
                 return;
             elseif (action.Message == 799) then
                 state.last_action = clock_seconds();
