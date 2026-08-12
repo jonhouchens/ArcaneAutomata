@@ -6,6 +6,12 @@ inspired by Invoker's orbiting elements in Dota 2.
 
 The addon does not use abilities, automate actions, or send gameplay commands.
 
+Out of Combat:
+<img width="319" height="224" alt="image" src="https://github.com/user-attachments/assets/0968260a-ee95-4304-bd4c-df12aef09900" />
+
+In Combat:
+<img width="467" height="382" alt="image" src="https://github.com/user-attachments/assets/aedc902e-ed02-4962-860f-df2dbfba5e14" />
+
 ## Load
 
 ```text
