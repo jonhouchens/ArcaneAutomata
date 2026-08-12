@@ -1,6 +1,6 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '3.0.0';
+addon.version   = '1.0.0';
 addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
 
 require 'common';
@@ -20,7 +20,8 @@ local MANEUVER_MIN_ID = 141;
 local MANEUVER_MAX_ID = 148;
 local MANEUVER_RESOURCE_OFFSET = 512;
 local MANEUVER_RECAST_SECONDS = 10;
-local MANEUVER_CONFIRM_TIMEOUT = 2.5;
+local MANEUVER_SYNC_TIMEOUT = 2.5;
+local MANEUVER_ABORT_TIMEOUT = 5.0;
 local OVERLOAD_BUFF_ID = 299;
 local ORIGIN_WORLD_LIFT = 0.10;
 local TAU = math.pi * 2;
@@ -136,7 +137,6 @@ local state = {
     settings = settings.load(defaults),
     slots = {},
     fading_slots = {},
-    attempts = {},
     element_chances = {},
     overload_flash = nil,
     confirmation_flash = nil,
@@ -144,7 +144,7 @@ local state = {
     last_action = -10,
     recast_was_active = false,
     recast_ready_at = -10,
-    pending_maneuver = nil,
+    pending_sync = nil,
     was_pup = false,
     was_alive = false,
     was_zoning = false,
@@ -252,11 +252,10 @@ end
 local function clear_slots()
     state.slots = {};
     state.fading_slots = {};
-    state.attempts = {};
     state.element_chances = {};
     state.overload_flash = nil;
     state.confirmation_flash = nil;
-    state.pending_maneuver = nil;
+    state.pending_sync = nil;
     state.recast_was_active = false;
     state.recast_ready_at = -10;
     state.anchor_x = nil;
@@ -294,7 +293,7 @@ local function ensure_test_slots(force)
 
     state.slots = {};
     state.fading_slots = {};
-    state.pending_maneuver = nil;
+    state.pending_sync = nil;
     for index = 1, count do
         local element = by_name[string.lower(
             state.settings.test_elements[index])];
@@ -432,16 +431,40 @@ local function tracked_counts()
     return counts;
 end
 
-local function total_count(counts)
-    local total = 0;
-    for _, count in pairs(counts) do
-        total = total + count;
+local function maneuver_count_total(counts)
+    local count = 0;
+    for _, value in pairs(counts) do
+        count = count + value;
     end
-    return total;
+    return count;
 end
 
-local function retire_slot(index, now)
-    local slot = table.remove(state.slots, index);
+local function maneuver_counts_equal(left, right)
+    for ability_id = MANEUVER_MIN_ID, MANEUVER_MAX_ID do
+        local name = elements[ability_id].name;
+        if ((left[name] or 0) ~= (right[name] or 0)) then
+            return false;
+        end
+    end
+    return true;
+end
+
+local function begin_layout_transition(now)
+    if (not state.settings.transitions) then
+        return;
+    end
+    now = now or clock_seconds();
+    for _, slot in ipairs(state.slots) do
+        if (slot.last_x ~= nil and slot.last_y ~= nil) then
+            slot.layout_from_x = slot.last_x;
+            slot.layout_from_y = slot.last_y;
+            slot.layout_from_depth = slot.last_depth or 0;
+            slot.layout_started = now;
+        end
+    end
+end
+
+local function fade_slot(slot, now)
     if (slot == nil or not state.settings.transitions) then
         return;
     end
@@ -452,24 +475,119 @@ local function retire_slot(index, now)
     end
 end
 
+local function retire_slot(index, now)
+    local slot = table.remove(state.slots, index);
+    begin_layout_transition(now);
+    fade_slot(slot, now);
+end
+
+local function earliest_slot_index(name)
+    local selected_index = nil;
+    local selected_expiry = math.huge;
+    for index, slot in ipairs(state.slots) do
+        if ((name == nil or slot.name == name)
+            and slot.expires < selected_expiry) then
+            selected_index = index;
+            selected_expiry = slot.expires;
+        end
+    end
+    return selected_index;
+end
+
 local function record_maneuver(element, approximate, started)
     if (element == nil) then
         return nil;
     end
-    while (#state.slots >= 3) do
-        retire_slot(1, clock_seconds());
-    end
-
-    local now = started or clock_seconds();
+    local now = clock_seconds();
+    local action_started = started or now;
     local slot = {
         name = element.name,
         ability = element.ability,
-        started = now,
-        expires = now + MANEUVER_DURATION,
+        started = action_started,
+        appeared = now,
+        expires = action_started + MANEUVER_DURATION,
         approximate = approximate == true,
     };
+
+    if (#state.slots >= 3) then
+        local replace_index = earliest_slot_index();
+        local replaced = state.slots[replace_index];
+        if (replaced.name == element.name) then
+            -- Refresh the matching visual in place. Its timer and activation
+            -- ripple restart, but the orb itself never disappears or moves.
+            replaced.started = slot.started;
+            replaced.expires = slot.expires;
+            replaced.approximate = slot.approximate;
+            return replaced;
+        end
+
+        -- Crossfade a different element in the exact slot that the game
+        -- replaces, keeping the other two visuals completely stable.
+        fade_slot(replaced, now);
+        state.slots[replace_index] = slot;
+        return slot;
+    end
+
+    begin_layout_transition(now);
     table.insert(state.slots, slot);
     return slot;
+end
+
+local function apply_pending_maneuver(pending, actual, now)
+    local before = pending.before_counts;
+    local element = pending.element;
+    local unchanged = maneuver_counts_equal(actual, before);
+    local before_total = maneuver_count_total(before);
+    local slot = nil;
+
+    if (before_total >= 3 and unchanged) then
+        -- Counts cannot identify which duplicate was refreshed. The server
+        -- result proves that an instance of this element was replaced, so
+        -- refresh the earliest matching visual and leave every other element
+        -- untouched.
+        local index = earliest_slot_index(element.name);
+        slot = index ~= nil and state.slots[index] or nil;
+        if (slot ~= nil) then
+            slot.started = pending.seen;
+            slot.expires = pending.seen + MANEUVER_DURATION;
+            slot.approximate = false;
+        end
+    elseif (before_total >= 3) then
+        local replaced_name = nil;
+        for ability_id = MANEUVER_MIN_ID, MANEUVER_MAX_ID do
+            local name = elements[ability_id].name;
+            if ((before[name] or 0) > (actual[name] or 0)) then
+                replaced_name = name;
+                break;
+            end
+        end
+
+        local index = replaced_name ~= nil
+            and earliest_slot_index(replaced_name) or nil;
+        if (index ~= nil) then
+            local replaced = state.slots[index];
+            slot = {
+                name = element.name,
+                ability = element.ability,
+                started = pending.seen,
+                appeared = now,
+                expires = pending.seen + MANEUVER_DURATION,
+                approximate = false,
+            };
+            fade_slot(replaced, now);
+            state.slots[index] = slot;
+        end
+    end
+
+    if (slot == nil) then
+        slot = record_maneuver(element, false, pending.seen);
+    end
+    if (state.settings.confirmation_flash and slot ~= nil) then
+        state.confirmation_flash = {
+            slot = slot,
+            started = now,
+        };
+    end
 end
 
 local function reconcile_slots(force)
@@ -480,26 +598,54 @@ local function reconcile_slots(force)
     state.last_sync = now;
 
     local actual = current_buff_counts();
-    local pending = state.pending_maneuver;
+    local pending = state.pending_sync;
     if (not force and pending ~= nil) then
-        local actual_count = actual[pending.name] or 0;
-        local actual_total = total_count(actual);
-        local count_increased = actual_count > pending.before_count;
-        local full_replacement = pending.before_total >= 3 and actual_total >= 3;
-        if (count_increased or full_replacement) then
-            local confirmed_slot = record_maneuver(
-                pending.element, false, pending.seen);
-            if (state.settings.confirmation_flash and confirmed_slot ~= nil) then
-                state.confirmation_flash = {
-                    slot = confirmed_slot,
-                    started = now,
-                };
+        local elapsed = now - pending.seen;
+        local before = pending.before_counts;
+        local before_total = maneuver_count_total(before);
+        local expected_total = math.min(3, before_total + 1);
+        local actual_total = maneuver_count_total(actual);
+        local new_count_increased = (actual[pending.element.name] or 0)
+            > (before[pending.element.name] or 0);
+        local observed_complete = actual_total == expected_total
+            and new_count_increased;
+        local unchanged = maneuver_counts_equal(actual, before);
+        local unchanged_refresh = unchanged and before_total >= 3
+            and (before[pending.element.name] or 0) > 0;
+
+        if (observed_complete) then
+            -- Require the complete result on two reconciliation passes. This
+            -- prevents a torn memory read from committing a plausible but
+            -- transient three-buff snapshot.
+            if (pending.observed_counts == nil
+                or not maneuver_counts_equal(
+                    actual, pending.observed_counts)) then
+                pending.observed_counts = actual;
+                pending.observed_at = now;
+                return;
+            elseif (now - pending.observed_at < 0.20) then
+                return;
             end
-            state.pending_maneuver = nil;
-        elseif (now - pending.seen < MANEUVER_CONFIRM_TIMEOUT) then
+        elseif (not unchanged_refresh or elapsed < MANEUVER_SYNC_TIMEOUT) then
+            pending.observed_counts = nil;
+            pending.observed_at = nil;
+            -- Ignore both the unchanged pre-action snapshot and any partial
+            -- remove/add snapshots. Nothing visual changes until the complete
+            -- post-action state is available.
+            if (elapsed < MANEUVER_ABORT_TIMEOUT) then
+                return;
+            end
+            -- A successful action should settle well before this point. If it
+            -- does not, abandon the transaction and let ordinary buff
+            -- reconciliation recover from the one current snapshot.
+            state.pending_sync = nil;
+            pending = nil;
+        end
+
+        if (pending ~= nil) then
+            state.pending_sync = nil;
+            apply_pending_maneuver(pending, actual, now);
             return;
-        else
-            state.pending_maneuver = nil;
         end
     elseif (not force and now - state.last_action < 1.0) then
         -- Overload failures have no provisional maneuver, but their action can
@@ -508,16 +654,14 @@ local function reconcile_slots(force)
     end
     local tracked = tracked_counts();
 
-    -- Buff loss is authoritative. Remove the oldest matching instance first,
-    -- which preserves activation order for duplicates that remain.
+    -- Buff loss is authoritative. Remove the earliest-expiring matching
+    -- instance first so duplicate timers remain aligned with replacement rules.
     for name, count in pairs(tracked) do
         local excess = count - (actual[name] or 0);
         while (excess > 0) do
-            for index, slot in ipairs(state.slots) do
-                if (slot.name == name) then
-                    retire_slot(index, now);
-                    break;
-                end
+            local index = earliest_slot_index(name);
+            if (index ~= nil) then
+                retire_slot(index, now);
             end
             excess = excess - 1;
         end
@@ -536,26 +680,20 @@ local function reconcile_slots(force)
     end
 end
 
-local function record_attempt(element, chance)
+local function record_overload_chance(element, chance)
     if (element == nil) then
         return;
     end
     local now = clock_seconds();
-    table.insert(state.attempts, { name = element.name, time = now });
     if (chance ~= nil) then
         state.element_chances[element.name] = {
             chance = clamp(tonumber(chance) or 0, 0, 100),
             time = now,
         };
     end
-    for index = #state.attempts, 1, -1 do
-        if (now - state.attempts[index].time > 180) then
-            table.remove(state.attempts, index);
-        end
-    end
 end
 
-local function burden_risk(name, overloaded, active)
+local function burden_risk(name, overloaded)
     if (overloaded == nil) then
         local _, current_overload = current_buff_counts();
         overloaded = current_overload;
@@ -564,20 +702,14 @@ local function burden_risk(name, overloaded, active)
         return 'OVERLOAD', 100;
     end
 
-    local now = clock_seconds();
-    local recent = 0;
-    for _, attempt in ipairs(state.attempts) do
-        if (attempt.name == name and now - attempt.time <= 45) then
-            recent = recent + 1;
-        end
-    end
-    active = active or tracked_counts();
-    local score = recent * 16 + math.max(0, (active[name] or 0) - 1) * 10;
     local snapshot = state.element_chances[name];
-    if (snapshot ~= nil and now - snapshot.time <= 90) then
-        score = math.max(score, snapshot.chance);
+    if (snapshot == nil or clock_seconds() - snapshot.time > 90) then
+        -- The client does not expose enough information to reproduce Horizon's
+        -- overload calculation. Stay neutral rather than inventing risk from
+        -- active stacks or recent uses.
+        return 'LOW', 0;
     end
-    score = clamp(score, 0, 100);
+    local score = snapshot.chance;
     if (score >= 50) then
         return 'DANGER', score;
     elseif (score >= 20) then
@@ -1750,16 +1882,43 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
         local y = crown_y * inverse_orbit + orbit_y * orbit_mix;
         local depth = crown_depth * inverse_orbit + orbit_depth * orbit_mix;
 
+        -- When the formation gains or loses an orb, glide surviving orbs from
+        -- their previous rendered positions instead of snapping them to their
+        -- newly assigned crown/orbit slots.
+        if (state.settings.transitions and slot.layout_started ~= nil
+            and slot.layout_from_x ~= nil and slot.layout_from_y ~= nil) then
+            local progress = clamp(
+                (now - slot.layout_started) / TRANSITION_SECONDS, 0, 1);
+            if (progress < 1) then
+                local blend = progress * progress * (3 - 2 * progress);
+                x = slot.layout_from_x * (1 - blend) + x * blend;
+                y = slot.layout_from_y * (1 - blend) + y * blend;
+                depth = slot.layout_from_depth * (1 - blend) + depth * blend;
+            else
+                slot.layout_from_x = nil;
+                slot.layout_from_y = nil;
+                slot.layout_from_depth = nil;
+                slot.layout_started = nil;
+            end
+        elseif (not state.settings.transitions) then
+            slot.layout_from_x = nil;
+            slot.layout_from_y = nil;
+            slot.layout_from_depth = nil;
+            slot.layout_started = nil;
+        end
+
         local depth_normal = (depth + 1) * 0.5;
         local base_depth_scale = 0.82 + depth_normal * 0.18;
         local base_alpha = 0.58 + depth_normal * 0.40;
         local entrance = 1;
         if (state.settings.transitions) then
-            entrance = clamp((now - slot.started) / TRANSITION_SECONDS, 0, 1);
+            entrance = clamp(
+                (now - (slot.appeared or slot.started))
+                    / TRANSITION_SECONDS, 0, 1);
             entrance = 1 - (1 - entrance) * (1 - entrance) * (1 - entrance);
         end
         local risk = state.settings.test_mode and state.settings.test_risk
-            or burden_risk(slot.name, overloaded, active_counts);
+            or burden_risk(slot.name, overloaded);
         duplicate_seen[slot.name] = (duplicate_seen[slot.name] or 0) + 1;
         local item = {
             slot = slot,
@@ -1858,7 +2017,7 @@ local function draw_invocation_lattice(draw, items, now)
         formation_alpha * clamp(
             (0.30 + pulse * 0.07) * profile.intensity, 0, 0.72) });
 
-    -- Follow activation order around the triangle and bow each edge inward.
+    -- Follow formation order around the triangle and bow each edge inward.
     for index = 1, 3 do
         local first = active[index];
         local second = active[index % 3 + 1];
@@ -1979,7 +2138,7 @@ local function draw_invocation_lattice(draw, items, now)
         return;
     end
 
-    -- One mote traces the three edges in activation order. Its speed conveys
+    -- One mote traces the three edges in formation order. Its speed conveys
     -- burden state, while the outer orbital mote remains the exact recast clock.
     local cycle = (now * profile.circuit_speed) % 3;
     local edge_index = math.floor(cycle) + 1;
@@ -2016,6 +2175,13 @@ local function draw_invocation_lattice(draw, items, now)
 end
 
 local function draw_duplicate_resonance(draw, items, now)
+    -- Treat every inter-orb connection as part of the lattice presentation.
+    -- Otherwise duplicate maneuvers can leave lattice-like threads visible
+    -- after the user explicitly disables the lattice.
+    if (not state.settings.lattice) then
+        return;
+    end
+
     local groups = {};
     for _, item in ipairs(items) do
         if (item.slot ~= nil and not item.departing
@@ -2489,21 +2655,19 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             -- 798 is a successful maneuver. 799 is an overload failure.
             if (action.Message == 798) then
                 local now = clock_seconds();
-                local tracked = tracked_counts();
+                local before_counts = tracked_counts();
                 state.last_action = now;
-                record_attempt(element, action.Param);
-                state.pending_maneuver = {
-                    name = element.name,
+                record_overload_chance(element, action.Param);
+                state.pending_sync = {
                     element = element,
+                    before_counts = before_counts,
                     seen = now,
-                    before_count = tracked[element.name] or 0,
-                    before_total = total_count(tracked),
                 };
                 return;
             elseif (action.Message == 799) then
                 state.last_action = clock_seconds();
-                state.pending_maneuver = nil;
-                record_attempt(element, action.Param);
+                state.pending_sync = nil;
+                record_overload_chance(element, action.Param);
                 state.overload_flash = {
                     ability = element.ability,
                     started = state.last_action,

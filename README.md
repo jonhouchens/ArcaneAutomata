@@ -121,10 +121,14 @@ disabled with `/aa test off`.
 ## Display behavior
 
 - Buffs 300-307 are reconciled with action packet IDs 141-148.
-- Successful action packets remain provisional for up to 2.5 seconds and only
-  become orbs after the live maneuver buff count confirms them. Clipped actions
-  are discarded instead of creating false 60-second orbs.
+- Successful action packets open an atomic update. The addon ignores partial
+  removal/addition snapshots and changes the formation once the complete buff
+  result is visible. At three stacks, an unchanged result refreshes the
+  earliest matching element in place without disturbing the other maneuvers.
 - Each active instance gets its own orb, including duplicate maneuvers.
+- At three active maneuvers, the orb with the least duration remaining is
+  replaced in place. Reapplying that same element refreshes the existing orb
+  without moving the other two.
 - Packet-observed maneuvers receive exact 60-second timers.
 - Maneuvers found on load receive dotted approximate timer rings because the
   original application time is not exposed by the normal buff list.
@@ -158,8 +162,9 @@ disabled with `/aa test off`.
   bands, stone plating, a lightning cage, droplet crown, sun rays, or eclipse
   crescents. Identity no longer depends on the center glyph and color alone.
 - Duplicate elements resonate: their pulse synchronizes and faint curved energy
-  threads carry small motes between matching orbs.
-- With three active maneuvers, the invocation lattice connects them in activation
+  threads carry small motes between matching orbs. These inter-orb threads are
+  also hidden by `/aa lattice off`.
+- With three active maneuvers, the invocation lattice connects them in formation
   order with luminous layered threads, a pulsing central seal, and one glowing
   traveling mote. Use
   `/aa lattice off` to hide it. Three identical maneuvers use this lattice in
@@ -170,7 +175,8 @@ disabled with `/aa test off`.
   `OVERLOAD` uses red, fracturing the orderly circuit into irregular sparks.
   `/aa burden off` leaves the lattice in its calm `LOW` presentation.
 - Maneuvers bloom in with an elemental ripple and dissolve when their buff is
-  lost. `/aa transitions off` restores immediate appearance and removal.
+  lost. As the formation changes, surviving orbs glide into their new slots.
+  `/aa transitions off` restores immediate appearance and removal.
 - When the automaton's entity enters its deployed combat state, `/aa deployfx on`
   tightens the formation by eight percent, slightly compresses its height, and
   brightens and enlarges the orbs. The default `/aa deploystyle seals` places a
@@ -191,18 +197,17 @@ disabled with `/aa test off`.
   o'clock during the carousel and becomes a compact local progress gauge so it
   cannot be confused with the orbiting maneuvers. `/aa deployorbit off` keeps
   the deploy focus and seals but disables the carousel.
-- A successful action does not immediately trigger the confirmation flash. The
-  addon waits until the corresponding maneuver buff is present, then emits a
-  short elemental ring with four pale locking ticks. This distinguishes a
-  server-confirmed maneuver from a clipped attempt. Use `/aa confirmflash off`
-  to disable it.
+- Once a successful server action's complete buff result is visible, the addon
+  emits a short elemental ring with four pale locking ticks. Overload failures
+  retain their separate warning flash. Use `/aa confirmflash off` to disable it.
 - `/aa smoothing 0.12` applies a small camera-anchor damping window; zero turns
   smoothing off, while values up to 0.50 produce progressively softer motion.
-- The high-visibility burden halo uses a conservative local estimate: a
-  bright brass segmented rail for warm, thicker pulsing orange for danger, and
-  fractured red while overloaded. Outward warning ticks keep it visually
-  separate from the inner expiration ring. Server-reported chances from
-  maneuver action packets remain authoritative when available.
+- The high-visibility burden halo uses the latest overload percentage reported
+  by the server for each element: a bright brass segmented rail for warm,
+  thicker pulsing orange for danger, and fractured red while overloaded.
+  Outward warning ticks keep it visually separate from the inner expiration
+  ring. When no recent server percentage exists, AA stays neutral instead of
+  estimating from active stacks or recent uses.
 - The default colorblind palette is based on Okabe-Ito hues and every element
   also has distinct rune and crest silhouettes.
 
