@@ -228,9 +228,8 @@ It also hides when disabled or when no valid anchor is available.
 ## HorizonXI approval
 
 Arcane Automata is intentionally visual-only, but HorizonXI requires custom addons to
-be reviewed and added to its approved-addon list before use. Publicly host the
-source and submit it through the server's current addon-review process before
-using it in live play.
+be reviewed and added to its approved-addon list before use. Currently, this addon
+has been submitted and is awaiting feedback / approval.
 
 ## License
 
