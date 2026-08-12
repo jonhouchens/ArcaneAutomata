@@ -1,0 +1,9 @@
+# Ashita per-profile settings belong outside this source repository.
+config/
+
+# Local editor and operating-system files.
+.vs/
+.vscode/
+Thumbs.db
+desktop.ini
+*.log
