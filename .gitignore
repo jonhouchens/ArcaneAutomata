@@ -7,3 +7,6 @@ config/
 Thumbs.db
 desktop.ini
 *.log
+
+# Local standalone burden-model test harness.
+test_burdenmodel.lua

@@ -12,6 +12,10 @@ Out of Combat:
 In Combat:
 <img width="467" height="382" alt="image" src="https://github.com/user-attachments/assets/aedc902e-ed02-4962-860f-df2dbfba5e14" />
 
+Its burden support uses the shared `burdenmodel.lua`, `burdenforecast.lua`, and `pupstats.lua`
+libraries from Ashita's `addons/libs` directory, the same implementations used
+by PUPMan.
+
 ## Load
 
 ```text
@@ -53,6 +57,15 @@ The primary short command is `/aa`. The previous `/po`, `/puporbit`,
 /aa smoothing 0.12
 /aa burden on
 /aa burden off
+/aa burden threshold 0
+/aa burden threshold 5
+/aa burden heatsink auto
+/aa burden heatsink on
+/aa burden heatsink off
+/aa burden halfdark auto
+/aa burden halfdark on
+/aa burden halfdark off
+/aa burden status
 /aa lattice on
 /aa lattice off
 /aa deployfx on
@@ -81,10 +94,12 @@ The primary short command is `/aa`. The previous `/po`, `/puporbit`,
 /aa test count 1
 /aa test count 2
 /aa test count 3
+/aa test risk safe
 /aa test risk low
 /aa test risk warm
 /aa test risk danger
 /aa test risk overload
+/aa test risk unknown
 /aa test set fire ice thunder
 /aa test recast
 /aa test deploy on
@@ -123,6 +138,11 @@ to compare the idle and focused formations, and `/aa test flash [element]` to
 replay the authoritative maneuver-confirmation pulse. Test mode is visual-only
 and never sends gameplay commands. It overrides live maneuver display until
 disabled with `/aa test off`.
+
+For the next-use warning specifically, `/aa test risk danger` shows the broken
+orange pressure rail and four vents on every preview orb. Then `/aa test recast`
+demonstrates the brief warning expansion when Maneuver becomes ready. `warm`
+colors only the lattice; `overload` previews the separate red failure state.
 
 ## Display behavior
 
@@ -175,11 +195,15 @@ disabled with `/aa test off`.
   traveling mote. Use
   `/aa lattice off` to hide it. Three identical maneuvers use this lattice in
   place of a second overlapping duplicate-resonance triangle.
-- The lattice is deliberately not a second timer. It reflects the worst current
-  burden state: a calm teal five-second circuit at `LOW`, an amber circuit of
+- The lattice is deliberately not a second timer. It reflects the worst
+  predicted risk of reusing any visible maneuver: a calm teal five-second
+  circuit at exact-zero `SAFE`, a subtly quicker green circuit for nonzero
+  `LOW` risk below 20%, an amber circuit of
   about 3.5 seconds at `WARM`, and two-second orange energy at `DANGER`. Only
   `OVERLOAD` uses red, fracturing the orderly circuit into irregular sparks.
-  `/aa burden off` leaves the lattice in its calm `LOW` presentation.
+  Cold-attached `UNKNOWN` state uses a quiet neutral-gray circuit instead of
+  implying safety. `/aa burden off` leaves the lattice in its calm `SAFE`
+  presentation.
 - Maneuvers bloom in with an elemental ripple and dissolve when their buff is
   lost. As the formation changes, surviving orbs glide into their new slots.
   `/aa transitions off` restores immediate appearance and removal.
@@ -208,12 +232,36 @@ disabled with `/aa test off`.
   retain their separate warning flash. Use `/aa confirmflash off` to disable it.
 - `/aa smoothing 0.12` applies a small camera-anchor damping window; zero turns
   smoothing off, while values up to 0.50 produce progressively softer motion.
-- The high-visibility burden halo uses the latest overload percentage reported
-  by the server for each element: a bright brass segmented rail for warm,
-  thicker pulsing orange for danger, and fractured red while overloaded.
-  Outward warning ticks keep it visually separate from the inner expiration
-  ring. When no recent server percentage exists, AA stays neutral instead of
-  estimating from active stacks or recent uses.
+- The high-visibility burden warning asks a deliberately actionable question:
+  "What happens if I reuse this visible maneuver now?" At a predicted 50% or
+  higher overload roll, that orb gains a broken orange pressure rail with four
+  outward-facing, trembling vents. The warning briefly expands when Maneuver
+  recast becomes ready. A predicted 100% roll burns hot orange-white, while red
+  remains reserved for an Overload that has actually happened. `LOW` is a real
+  nonzero chance, while `WARM` risk
+  colors the shared lattice but does not surround individual orbs, keeping the
+  formation readable. The exact percentage and cooling ETA belong in PUPMan.
+  Action results 798/799 anchor each elemental gauge, then the shared model applies
+  the telemetry-fitted Horizon profile between observations: fresh burden 30
+  at the assumed base threshold 30, normal-frame Dark gain 15, and one decay
+  per three-second tick. Unknown elements from a cold attach stay neutral until a
+  server result anchors them. For non-Dark Maneuvers, gain prediction compares
+  the master's live base-plus-gear stat with the automaton's exact
+  base-plus-additional stat from PUP packet `0x44`. The pair is snapshotted on
+  the outgoing Maneuver request so a fast aftercast swap does not contaminate
+  the prediction.
+- Horizon's private-fork constants are configurable in game. Use
+  `/aa burden threshold 5` only if you are wearing Puppetry Dastanas and Horizon
+  implements its +5 threshold; otherwise leave it at the default `0`. Enable
+  Heatsink and the Valoredge/Sharpshot reduced Dark rule default to `auto`,
+  using attachment and frame data from PUP packet `0x44`. The `on` and `off`
+  commands remain explicit testing overrides. Active Water Maneuvers
+  raise total decay to 2/3/4 per tick at one/two/three Water, with the first two
+  stages directly measured and the third linearly extrapolated.
+  `/aa burden status` prints the current model configuration, each element's
+  projected next-use chance and quality (`exact`, `estimate`, `bound`, or `unknown`),
+  and the seven live non-Dark master-minus-pet stat comparisons.
+  Buffoon's Collar is not available on Horizon, so it is not represented.
 - The default colorblind palette is based on Okabe-Ito hues and every element
   also has distinct rune and crest silhouettes.
 

@@ -1,11 +1,14 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '1.0.1';
+addon.version   = '1.3.0';
 addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
 
 require 'common';
 
 local actionpacket = require 'actionpacket';
+local burden       = require 'burdenmodel';
+local forecast     = require 'burdenforecast';
+local pupstats     = require 'pupstats';
 local chat         = require 'chat';
 local d3d8         = require 'd3d8';
 local ffi          = require 'ffi';
@@ -57,6 +60,7 @@ local by_name = {};
 for ability_id = MANEUVER_MIN_ID, MANEUVER_MAX_ID do
     local element = elements[ability_id];
     element.ability = ability_id;
+    element.burden_index = ability_id - MANEUVER_MIN_ID;
     by_buff[element.buff] = element;
     by_name[string.lower(element.name)] = element;
 end
@@ -76,6 +80,11 @@ local defaults = T{
     transitions = true,
     smoothing = 0.12,
     burden = true,
+    burden_threshold = 0,
+    burden_heatsink = false,
+    burden_half_dark = false,
+    burden_heatsink_mode = 'auto',
+    burden_halfdark_mode = 'auto',
     lattice = true,
     deploy_focus = true,
     deploy_style = 'seals',
@@ -112,12 +121,25 @@ local visual_presets = {
 };
 
 -- The outer recast mote is the precise clock. Lattice motion instead reflects
--- the worst current burden state across the three-maneuver formation.
-local lattice_risk_rank = { LOW = 1, WARM = 2, DANGER = 3, OVERLOAD = 4 };
+-- the worst predicted next-use burden state across the formation.
+local lattice_risk_rank = {
+    UNKNOWN = 0, SAFE = 1, LOW = 2, WARM = 3, DANGER = 4, OVERLOAD = 5,
+};
+local test_risk_score = {
+    SAFE = 0, LOW = 10, WARM = 35, DANGER = 70, OVERLOAD = 100,
+};
 local lattice_profiles = {
-    LOW = {
+    UNKNOWN = {
+        circuit_speed = 0.42, pulse_speed = 1.05, intensity = 0.78,
+        width = 0.92, tint_mix = 1.00, tint = { 0.45, 0.52, 0.56, 1.00 },
+    },
+    SAFE = {
         circuit_speed = 0.60, pulse_speed = 1.50, intensity = 1.00,
         width = 1.00, tint_mix = 1.00, tint = { 0.30, 0.78, 0.72, 1.00 },
+    },
+    LOW = {
+        circuit_speed = 0.70, pulse_speed = 1.85, intensity = 1.06,
+        width = 1.03, tint_mix = 1.00, tint = { 0.56, 0.86, 0.38, 1.00 },
     },
     WARM = {
         circuit_speed = 0.86, pulse_speed = 2.40, intensity = 1.15,
@@ -137,7 +159,6 @@ local state = {
     settings = settings.load(defaults),
     slots = {},
     fading_slots = {},
-    element_chances = {},
     overload_flash = nil,
     confirmation_flash = nil,
     last_sync = -1,
@@ -203,6 +224,13 @@ local function ensure_settings_shape()
     s.transitions = s.transitions ~= false;
     s.smoothing = clamp(tonumber(s.smoothing) or 0.12, 0, 0.50);
     s.burden = s.burden ~= false;
+    s.burden_threshold = tonumber(s.burden_threshold) == 5 and 5 or 0;
+    s.burden_heatsink = s.burden_heatsink == true;
+    s.burden_half_dark = s.burden_half_dark == true;
+    for _, key in ipairs({ 'burden_heatsink_mode', 'burden_halfdark_mode' }) do
+        local mode = string.lower(tostring(s[key] or 'auto'));
+        s[key] = (mode == 'on' or mode == 'off') and mode or 'auto';
+    end
     s.lattice = s.lattice ~= false;
     s.deploy_focus = s.deploy_focus ~= false;
     s.deploy_style = s.deploy_style == 'chevrons' and 'chevrons' or 'seals';
@@ -241,6 +269,53 @@ end
 
 ensure_settings_shape();
 
+local burden_stats = pupstats.attach({
+    alias = 'arcaneautomata_burden_stats',
+    now = clock_seconds,
+});
+
+local function effective_heatsink()
+    if (state.settings.burden_heatsink_mode == 'on') then
+        return true;
+    elseif (state.settings.burden_heatsink_mode == 'off') then
+        return false;
+    end
+    return burden_stats:has_attachment('Heatsink');
+end
+
+local function effective_half_dark()
+    if (state.settings.burden_halfdark_mode == 'on') then
+        return true;
+    elseif (state.settings.burden_halfdark_mode == 'off') then
+        return false;
+    end
+    return burden_stats.automaton_frame == 21
+        or burden_stats.automaton_frame == 22;
+end
+
+local burden_model = burden.attach({
+    alias = 'arcaneautomata_burden',
+    thresh_gear = state.settings.burden_threshold,
+    heatsink = effective_heatsink(),
+    frame_half_dark = effective_half_dark(),
+    stat_diff = function(element, phase)
+        return burden_stats:stat_diff(element, phase);
+    end,
+    now = clock_seconds,
+});
+
+local function configure_burden_model()
+    local heatsink = effective_heatsink();
+    local half_dark = effective_half_dark();
+    state.settings.burden_heatsink = heatsink;
+    state.settings.burden_half_dark = half_dark;
+    burden_model:configure({
+        thresh_gear = state.settings.burden_threshold,
+        heatsink = heatsink,
+        frame_half_dark = half_dark,
+    });
+end
+
 local function message(text)
     print(chat.header(DISPLAY_NAME):append(chat.message(text)));
 end
@@ -252,7 +327,6 @@ end
 local function clear_slots()
     state.slots = {};
     state.fading_slots = {};
-    state.element_chances = {};
     state.overload_flash = nil;
     state.confirmation_flash = nil;
     state.pending_sync = nil;
@@ -709,42 +783,27 @@ local function reconcile_slots(force)
     end
 end
 
-local function record_overload_chance(element, chance)
-    if (element == nil) then
-        return;
-    end
-    local now = clock_seconds();
-    if (chance ~= nil) then
-        state.element_chances[element.name] = {
-            chance = clamp(tonumber(chance) or 0, 0, 100),
-            time = now,
-        };
-    end
-end
-
 local function burden_risk(name, overloaded)
+    if (burden_model.heatsink ~= effective_heatsink()
+        or burden_model.frame_half_dark ~= effective_half_dark()) then
+        configure_burden_model();
+    end
     if (overloaded == nil) then
         local _, current_overload = current_buff_counts();
         overloaded = current_overload;
     end
-    if (overloaded) then
-        return 'OVERLOAD', 100;
+    local element = by_name[string.lower(tostring(name or ''))];
+    if (element == nil) then
+        return 'UNKNOWN', nil;
     end
-
-    local snapshot = state.element_chances[name];
-    if (snapshot == nil or clock_seconds() - snapshot.time > 90) then
-        -- The client does not expose enough information to reproduce Horizon's
-        -- overload calculation. Stay neutral rather than inventing risk from
-        -- active stacks or recent uses.
-        return 'LOW', 0;
+    -- Forecast reusing this visible maneuver: gain is applied before Horizon's
+    -- overload roll. Unknown cold-attached elements stay visually neutral.
+    local projected = forecast.predict(burden_model, element.burden_index,
+        overloaded or burden_model:is_overloaded());
+    if (projected.label == forecast.RISK.UNKNOWN) then
+        return 'UNKNOWN', nil;
     end
-    local score = snapshot.chance;
-    if (score >= 50) then
-        return 'DANGER', score;
-    elseif (score >= 20) then
-        return 'WARM', score;
-    end
-    return 'LOW', score;
+    return projected.label, projected.score;
 end
 
 local function transform_point(x, y, z, matrix)
@@ -1642,35 +1701,48 @@ local function draw_shared_recast_mote(draw, items, now)
 end
 
 local function draw_burden_halo(draw, item, radius, now)
-    if (not state.settings.burden or item.risk == nil or item.risk == 'LOW') then
+    if (not state.settings.burden
+        or (item.risk ~= 'DANGER' and item.risk ~= 'OVERLOAD')) then
         return;
     end
 
     local danger = item.risk == 'DANGER';
     local overloaded = item.risk == 'OVERLOAD';
-    local pulse_rate = overloaded and 8.0 or danger and 4.4 or 2.4;
+    local severity = danger and clamp(((item.risk_score or 50) - 50) / 50, 0, 1)
+        or 1;
+    local certain = danger and (item.risk_score or 0) >= 100;
+    local ready_age = now - state.recast_ready_at;
+    local ready_burst = ready_age >= 0 and ready_age < 0.72
+        and (1 - ready_age / 0.72) or 0;
+    local pulse_rate = overloaded and 8.0 or (4.4 + severity * 1.8);
     local pulse = 0.5 + 0.5 * math.sin(now * pulse_rate);
-    local color = item.risk == 'WARM' and { 0.96, 0.72, 0.25, 1.00 }
+    local color = certain and { 1.00, 0.72, 0.18, 1.00 }
         or danger and { 1.00, 0.40, 0.08, 1.00 }
         or { 1.00, 0.16, 0.10, 1.00 };
-    local base_alpha = overloaded and 0.72 or danger and 0.62 or 0.50;
-    local pulse_alpha = overloaded and 0.22 or danger and 0.16 or 0.10;
-    local alpha = item.alpha * (base_alpha + pulse * pulse_alpha);
-    local expansion = overloaded and 2.4 or danger and 1.5 or 0.8;
-    local halo = radius + (10.0 + pulse * expansion) * state.settings.scale;
+    local base_alpha = overloaded and 0.72 or (0.56 + severity * 0.12);
+    local pulse_alpha = overloaded and 0.22 or (0.14 + severity * 0.08);
+    local alpha = item.alpha * clamp(
+        base_alpha + pulse * pulse_alpha + ready_burst * 0.22, 0, 1);
+    local expansion = overloaded and 2.4 or (1.4 + severity * 0.9);
+    local halo = radius + (10.0 + pulse * expansion + ready_burst * 3.5)
+        * state.settings.scale;
     local color_u32 = imgui.GetColorU32(with_alpha(color, alpha));
-    local phase = now * (overloaded and 1.8 or danger and 0.85 or 0.42);
+    -- Danger clamps stay cardinal and tremble instead of reading as another
+    -- timer. Actual Overload retains the disorderly rotating fracture.
+    local phase = overloaded and now * 1.8
+        or math.pi / 4 + math.sin(now * 8.0) * (0.025 + severity * 0.025);
     local fragments = overloaded and 5 or 4;
-    local span = overloaded and 0.48 or danger and 0.92 or 1.08;
+    local span = overloaded and 0.48 or (0.70 + severity * 0.10);
     local thickness = state.settings.scale
         * (overloaded and (2.5 + pulse * 0.9)
-            or danger and (2.2 + pulse * 0.6)
-            or (1.9 + pulse * 0.35));
+            or (2.1 + severity * 0.45 + pulse * 0.6
+                + ready_burst * 0.7));
 
-    -- A dim complete rail makes even warm risk readable behind bright elements.
+    -- The dim pressure rail separates this warning from the segmented duration
+    -- ring drawn close to the orb.
     draw:AddCircle(
         { item.x, item.y }, halo,
-        imgui.GetColorU32(with_alpha(color, item.alpha * (danger and 0.20 or 0.15))),
+        imgui.GetColorU32(with_alpha(color, item.alpha * 0.20)),
         32, math.max(1.0, thickness + 1.8 * state.settings.scale));
 
     for index = 0, fragments - 1 do
@@ -1678,13 +1750,33 @@ local function draw_burden_halo(draw, item, radius, now)
         draw_arc(draw, item.x, item.y, halo, start_angle,
             start_angle + span, color_u32, math.max(1.0, thickness), 8);
 
-        -- Bright outward ticks keep the warning distinct from the timer ring.
+        -- Four outward-facing pressure vents say "do not reuse this element"
+        -- without adding text or another countdown to the world-space display.
         local marker_angle = start_angle + span * 0.5;
-        draw_radial_line(
-            draw, item.x, item.y,
-            halo - 1.0 * state.settings.scale,
-            halo + (overloaded and 4.5 or danger and 3.8 or 3.2) * state.settings.scale,
-            marker_angle, color_u32, math.max(1.0, thickness * 0.78));
+        if (overloaded) then
+            draw_radial_line(
+                draw, item.x, item.y,
+                halo - 1.0 * state.settings.scale,
+                halo + 4.5 * state.settings.scale,
+                marker_angle, color_u32, math.max(1.0, thickness * 0.78));
+        else
+            local inner = halo + 0.5 * state.settings.scale;
+            local outer = halo + (5.2 + severity * 2.0
+                + pulse * 1.0 + ready_burst * 2.0) * state.settings.scale;
+            local half_width = (2.1 + severity * 0.8)
+                * state.settings.scale;
+            local cosine, sine = math.cos(marker_angle), math.sin(marker_angle);
+            local perpendicular_x, perpendicular_y = -sine, cosine;
+            local base_x = item.x + cosine * inner;
+            local base_y = item.y + sine * inner;
+            draw:AddTriangleFilled(
+                { item.x + cosine * outer, item.y + sine * outer },
+                { base_x + perpendicular_x * half_width,
+                    base_y + perpendicular_y * half_width },
+                { base_x - perpendicular_x * half_width,
+                    base_y - perpendicular_y * half_width },
+                color_u32);
+        end
     end
 end
 
@@ -1870,6 +1962,7 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
     local count = #state.slots;
     local active_counts = tracked_counts();
     local duplicate_seen = {};
+    local risk_cache = {};
     local radius = state.settings.radius * state.settings.scale;
     local height = state.settings.height * state.settings.scale;
     focus_blend = clamp(focus_blend or 0, 0, 1);
@@ -1946,8 +2039,19 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
                     / TRANSITION_SECONDS, 0, 1);
             entrance = 1 - (1 - entrance) * (1 - entrance) * (1 - entrance);
         end
-        local risk = state.settings.test_mode and state.settings.test_risk
-            or burden_risk(slot.name, overloaded);
+        local risk, risk_score;
+        if (state.settings.test_mode) then
+            risk = state.settings.test_risk;
+            risk_score = test_risk_score[risk];
+        else
+            local cached = risk_cache[slot.name];
+            if (cached == nil) then
+                local label, score = burden_risk(slot.name, overloaded);
+                cached = { label = label, score = score };
+                risk_cache[slot.name] = cached;
+            end
+            risk, risk_score = cached.label, cached.score;
+        end
         duplicate_seen[slot.name] = (duplicate_seen[slot.name] or 0) + 1;
         local item = {
             slot = slot,
@@ -1960,6 +2064,7 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
             alpha = clamp(base_alpha * entrance
                 * (1 + 0.08 * focus_blend), 0, 1),
             risk = risk,
+            risk_score = risk_score,
             focus_blend = focus_blend,
             orbit_blend = orbit_mix,
             resonance_count = active_counts[slot.name] or 1,
@@ -1971,6 +2076,7 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
         slot.last_depth_scale = base_depth_scale;
         slot.last_alpha = base_alpha;
         slot.last_risk = risk;
+        slot.last_risk_score = risk_score;
         slot.last_focus_blend = focus_blend;
         slot.last_orbit_blend = orbit_mix;
     end
@@ -1990,6 +2096,7 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
                 depth_scale = (slot.last_depth_scale or 1) * (0.82 + fade * 0.18),
                 alpha = (slot.last_alpha or 0.8) * fade,
                 risk = slot.last_risk,
+                risk_score = slot.last_risk_score,
                 focus_blend = slot.last_focus_blend or 0,
                 orbit_blend = slot.last_orbit_blend or 0,
                 departing = true,
@@ -2021,17 +2128,23 @@ local function draw_invocation_lattice(draw, items, now)
         return (left.activation_index or 0) < (right.activation_index or 0);
     end);
 
-    local lattice_risk = 'LOW';
+    local lattice_risk = 'SAFE';
     if (state.settings.burden) then
+        local has_unknown = false;
         for _, item in ipairs(active) do
-            local item_risk = item.risk or 'LOW';
-            if ((lattice_risk_rank[item_risk] or 1)
-                > (lattice_risk_rank[lattice_risk] or 1)) then
+            local item_risk = item.risk or 'UNKNOWN';
+            if (item_risk == 'UNKNOWN') then
+                has_unknown = true;
+            elseif ((lattice_risk_rank[item_risk] or 0)
+                > (lattice_risk_rank[lattice_risk] or 0)) then
                 lattice_risk = item_risk;
             end
         end
+        if (has_unknown and lattice_risk == 'SAFE') then
+            lattice_risk = 'UNKNOWN';
+        end
     end
-    local profile = lattice_profiles[lattice_risk] or lattice_profiles.LOW;
+    local profile = lattice_profiles[lattice_risk] or lattice_profiles.UNKNOWN;
 
     local centroid_x = (active[1].x + active[2].x + active[3].x) / 3;
     local centroid_y = (active[1].y + active[2].y + active[3].y) / 3;
@@ -2602,6 +2715,10 @@ local function print_help()
         '/aa effects on | off',
         '/aa transitions on | off | smoothing <0.00-0.50>',
         '/aa burden on | off',
+        '/aa burden threshold 0 | 5',
+        '/aa burden heatsink auto | on | off',
+        '/aa burden halfdark auto | on | off',
+        '/aa burden status',
         '/aa lattice on | off',
         '/aa deployfx on | off | toggle',
         '/aa deploystyle seals | chevrons',
@@ -2615,7 +2732,7 @@ local function print_help()
         '/aa test on | off | status | recast',
         '/aa test deploy on | off | toggle',
         '/aa test flash [element]',
-        '/aa test count <1-3> | risk <low|warm|danger|overload>',
+        '/aa test count <1-3> | risk <safe|low|warm|danger|overload|unknown>',
         '/aa test set <element> <element> <element>',
         '/aa reset | help',
     };
@@ -2630,10 +2747,12 @@ settings.register('settings', 'settings_update', function(s)
         state.settings = s;
     end
     ensure_settings_shape();
+    configure_burden_model();
 end);
 
 ashita.events.register('load', 'load_cb', function()
     ensure_settings_shape();
+    configure_burden_model();
     if (state.settings.test_mode) then
         ensure_test_slots(true);
     else
@@ -2648,6 +2767,8 @@ ashita.events.register('load', 'load_cb', function()
 end);
 
 ashita.events.register('unload', 'unload_cb', function()
+    burden_model:detach();
+    burden_stats:detach();
     clear_slots();
     settings.save();
 end);
@@ -2686,7 +2807,6 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
                 local now = clock_seconds();
                 local before_counts = tracked_counts();
                 state.last_action = now;
-                record_overload_chance(element, action.Param);
                 local immediate_slot = apply_immediate_maneuver(
                     element, before_counts, now);
                 if (immediate_slot ~= nil) then
@@ -2703,7 +2823,6 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             elseif (action.Message == 799) then
                 state.last_action = clock_seconds();
                 state.pending_sync = nil;
-                record_overload_chance(element, action.Param);
                 state.overload_flash = {
                     ability = element.ability,
                     started = state.last_action,
@@ -2805,8 +2924,75 @@ ashita.events.register('command', 'command_cb', function(e)
             or command == 'orbitspeed' and 'deploy_orbit_speed'
             or command;
         message(string.format('%s: %.2f.', command, state.settings[setting_key]));
+    elseif (command == 'burden') then
+        local option = string.lower(args[3] or 'toggle');
+        if (option == 'threshold') then
+            local threshold = tonumber(args[4]);
+            if (threshold ~= 0 and threshold ~= 5) then
+                error_message('Use /aa burden threshold 0 or 5.');
+                return;
+            end
+            state.settings.burden_threshold = threshold;
+            configure_burden_model();
+            message(('Burden threshold gear: +%d.'):fmt(threshold));
+        elseif (option == 'heatsink' or option == 'halfdark') then
+            local mode_key = option == 'heatsink'
+                and 'burden_heatsink_mode' or 'burden_halfdark_mode';
+            local mode = string.lower(args[4] or '');
+            if (mode ~= 'auto' and mode ~= 'on' and mode ~= 'off') then
+                error_message('Use /aa burden ' .. option
+                    .. ' auto, on, or off.');
+                return;
+            end
+            state.settings[mode_key] = mode;
+            configure_burden_model();
+            local effective = option == 'heatsink'
+                and effective_heatsink() or effective_half_dark();
+            message(('Burden %s: %s (effective %s).'):fmt(
+                option, mode, effective and 'on' or 'off'));
+        elseif (option == 'status') then
+            configure_burden_model();
+            burden_model:tick();
+            message(('Burden model: threshold +%d | Heatsink %s (%s) | Water %d | decay %d/tick | half-dark %s (%s).'):fmt(
+                state.settings.burden_threshold,
+                effective_heatsink() and 'on' or 'off',
+                state.settings.burden_heatsink_mode,
+                burden_model.water_maneuvers or 0,
+                burden_model:decay_per_tick(),
+                effective_half_dark() and 'on' or 'off',
+                state.settings.burden_halfdark_mode));
+            local readings = {};
+            for ability_id = MANEUVER_MIN_ID, MANEUVER_MAX_ID do
+                local element = elements[ability_id];
+                local projected = forecast.predict(
+                    burden_model, element.burden_index, false);
+                readings[#readings + 1] = projected.score == nil
+                    and (element.name .. '=?/' .. projected.quality)
+                    or (('%s=%d%%/%s'):fmt(
+                        element.name, math.floor(projected.score + 0.5),
+                        projected.quality));
+                if (#readings == 4) then
+                    message('Next-use chances: ' .. table.concat(readings, ' | '));
+                    readings = {};
+                end
+            end
+            if (#readings > 0) then
+                message('Next-use chances: ' .. table.concat(readings, ' | '));
+            end
+            for _, group in ipairs(burden_stats:summary_groups(4)) do
+                message('Burden stats (master-pet): ' .. group);
+            end
+        else
+            local value = parse_switch(option, state.settings.burden);
+            if (value == nil) then
+                error_message('Use /aa burden on, off, or status.');
+                return;
+            end
+            state.settings.burden = value;
+            message('burden: ' .. (value and 'on.' or 'off.'));
+        end
     elseif (command == 'timers' or command == 'recast' or command == 'effects'
-        or command == 'transitions' or command == 'burden'
+        or command == 'transitions'
         or command == 'lattice' or command == 'deployfx'
         or command == 'deployorbit' or command == 'confirmflash'
         or command == 'colorblind' or command == 'fallback'
@@ -2865,7 +3051,7 @@ ashita.events.register('command', 'command_cb', function(e)
         elseif (option == 'risk') then
             local risk = string.upper(args[4] or '');
             if (lattice_profiles[risk] == nil) then
-                error_message('Use /aa test risk low, warm, danger, or overload.');
+                error_message('Use /aa test risk safe, low, warm, danger, overload, or unknown.');
                 return;
             end
             state.settings.test_risk = risk;
@@ -2949,6 +3135,8 @@ ashita.events.register('command', 'command_cb', function(e)
         end
     elseif (command == 'reset') then
         settings.reset();
+        ensure_settings_shape();
+        configure_burden_model();
         clear_slots();
         state.last_sync = -1;
         message('Settings and tracked timers reset.');
