@@ -16,6 +16,12 @@ Its burden support uses the shared `burdenmodel.lua`, `burdenforecast.lua`, and 
 libraries from Ashita's `addons/libs` directory, the same implementations used
 by PUPMan.
 
+## Install
+
+Copy `arcaneautomata.lua` and `actionpacket.lua` into
+`<Ashita>/addons/arcaneautomata/`. Then copy every Lua file from this
+repository's `libs/` directory into `<Ashita>/addons/libs/`.
+
 ## Load
 
 ```text
