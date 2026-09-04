@@ -1,5 +1,5 @@
 --[[
-burdenmodel.lua (v2.5) — standalone PUP burden/overload library for Ashita v4
+burdenmodel.lua (v2.6) — standalone PUP burden/overload library for Ashita v4
 Install: Ashita/addons/libs/burdenmodel.lua
 Usage from any addon:
 
@@ -53,7 +53,9 @@ HORIZON MODEL (observed unless explicitly marked as an LSB prior)
       Decay continues while overloaded.
   * Maneuver gain:
       Dark: 15 on normal frames (observed); 8 on Valoredge/Sharpshot (LSB prior)
-      Else, d = masterStat - petStat: d>=4 -> 14; 0<=d<4 -> 19-d; d<0 -> 20
+      Else, d = masterStat - petStat: d>=4 -> 14; d=3 -> 15;
+      0<=d<=2 -> 19-d; d<0 -> 20. The d=3 exception is Horizon telemetry-
+      fitted; repeated fresh-pet Light Maneuvers report one less than LSB.
   * Threshold = 30 + OVERLOAD_THRESH on the master.
       Horizon-era sources: none confirmed. LSB grants +5 on Puppetry Dastanas
       (and +5 on Buffoon's Collar, which Horizon does not have).
@@ -76,7 +78,7 @@ UNSUPPORTED / OUT OF SCOPE
 ]]
 
 local lib = {}
-lib.VERSION = '2.5'
+lib.VERSION = '2.6'
 
 --------------------------------------------------------------------------
 -- constants (exported for other addons)
@@ -350,6 +352,7 @@ function Model:estimated_gain(elementIdx, stat_diff_override)
         if d == nil then d = self:stat_context(elementIdx, 'estimate') end
         if d == nil then gain = 20            -- worst case
         elseif d >= 4 then gain = 14
+        elseif d == 3 then gain = 15 -- Horizon telemetry; LSB returns 16
         elseif d >= 0 then gain = 19 - d
         else gain = 20 end
     end

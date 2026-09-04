@@ -1,6 +1,6 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '1.3.0';
+addon.version   = '1.3.4';
 addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
 
 require 'common';
@@ -371,11 +371,14 @@ local function ensure_test_slots(force)
     for index = 1, count do
         local element = by_name[string.lower(
             state.settings.test_elements[index])];
+        -- Space preview applications by the real shared recast so deployed
+        -- timer priority can be inspected instead of showing three full rings.
+        local age = (count - index) * MANEUVER_RECAST_SECONDS;
         table.insert(state.slots, {
             name = element.name,
             ability = element.ability,
-            started = now,
-            expires = now + MANEUVER_DURATION,
+            started = now - age,
+            expires = now + MANEUVER_DURATION - age,
             approximate = false,
             test_preview = true,
         });
@@ -1530,14 +1533,38 @@ local function draw_element_shell(draw, element, x, y, radius, color, alpha, now
     end
 end
 
-local function draw_timer_ring(draw, x, y, radius, remaining, approximate, base_color, alpha, now)
+local function draw_timer_ring(draw, x, y, radius, remaining, approximate,
+    base_color, alpha, now, expiry_priority, deploy_blend)
     if (not state.settings.timers) then
         return;
     end
 
+    expiry_priority = clamp(expiry_priority or 0, 0, 1);
+    deploy_blend = clamp(deploy_blend or 0, 0, 1);
+    if (expiry_priority > 0) then
+        -- Counter carousel depth fading only for the timer that matters next.
+        alpha = alpha * (1 - expiry_priority)
+            + math.max(alpha, 0.96) * expiry_priority;
+    else
+        -- Let the other exact timers remain available without competing for
+        -- immediate attention in the visually busy deployed formation.
+        alpha = alpha * (1 - 0.34 * deploy_blend);
+    end
+
     local fraction = clamp(remaining / MANEUVER_DURATION, 0, 1);
     local ring_color = base_color;
-    local thickness = math.max(1.3, state.settings.scale * 1.7);
+    if (expiry_priority > 0 and remaining > 15) then
+        local priority_color = { 0.76, 1.00, 0.94, 1.00 };
+        local blend = 0.58 * expiry_priority;
+        ring_color = {
+            ring_color[1] * (1 - blend) + priority_color[1] * blend,
+            ring_color[2] * (1 - blend) + priority_color[2] * blend,
+            ring_color[3] * (1 - blend) + priority_color[3] * blend,
+            1.00,
+        };
+    end
+    local thickness = math.max(1.3, state.settings.scale * 1.7)
+        * (1 + 0.42 * expiry_priority);
     local ring_radius = radius + 4.5 * state.settings.scale;
     if (remaining <= 5) then
         local pulse = 0.5 + 0.5 * math.sin(now * TAU * 2.0);
@@ -1954,7 +1981,74 @@ local function draw_orb(draw, item, now)
     end
     draw_timer_ring(
         draw, item.x, item.y, radius, remaining,
-        item.slot.approximate, color, alpha, now);
+        item.slot.approximate, color, alpha, now,
+        item.expiry_priority, item.expiry_contrast);
+end
+
+local function find_next_expiry_item(items, focus_blend)
+    focus_blend = clamp(focus_blend or 0, 0, 1);
+    if (not state.settings.timers or focus_blend <= 0.01) then
+        return nil;
+    end
+
+    local active_count = 0;
+    local next_item = nil;
+    for _, item in ipairs(items) do
+        if (item.slot ~= nil and not item.departing) then
+            active_count = active_count + 1;
+            if (next_item == nil
+                or item.slot.expires < next_item.slot.expires) then
+                next_item = item;
+            end
+        end
+    end
+
+    -- A priority marker adds no information with one maneuver. Cold-attached
+    -- timers do not contain an authoritative application order, so do not
+    -- imply that one of their dotted rings is known to expire first.
+    if (active_count < 2 or next_item == nil
+        or next_item.slot.approximate) then
+        return nil;
+    end
+    return next_item;
+end
+
+local function draw_next_expiry_marker(draw, next_item, focus_blend, now)
+    focus_blend = clamp(focus_blend or 0, 0, 1);
+    local reveal = next_item ~= nil
+        and clamp(next_item.expiry_priority or 0, 0, 1) or 0;
+    if (next_item == nil or focus_blend <= 0.01 or reveal <= 0.01) then
+        return;
+    end
+
+    local scale = state.settings.scale;
+    local remaining = math.max(0, next_item.slot.expires - now);
+    local urgency = 1 - clamp(remaining / 15, 0, 1);
+    local slow_pulse = 0.5 + 0.5 * math.sin(now * 3.0);
+    local fast_pulse = 0.5 + 0.5 * math.sin(now * 7.0);
+    local pulse = slow_pulse * (1 - urgency) + fast_pulse * urgency;
+    -- Keep this cue bright even when its orb rotates to the rear of the
+    -- deployed carousel; depth fading is what makes ring comparison difficult.
+    local alpha = reveal * (0.68 + pulse * (0.10 + urgency * 0.08));
+    local tip_y = next_item.y - (25.2 + pulse * 0.6) * scale;
+    local wing_y = tip_y - (4.8 + urgency * 0.6) * scale;
+    local half_width = (4.2 + urgency * 0.5) * scale;
+    local shadow = imgui.GetColorU32({ 0.002, 0.012, 0.018, alpha * 0.92 });
+    local brass = imgui.GetColorU32({ 0.96, 0.72, 0.24, alpha * 0.92 });
+    local light = imgui.GetColorU32({ 0.76, 1.00, 0.94, alpha });
+    local left = { next_item.x - half_width, wing_y };
+    local tip = { next_item.x, tip_y };
+    local right = { next_item.x + half_width, wing_y };
+
+    -- A compact filled pin reinforces the ring hierarchy without adding a
+    -- label, countdown panel, or another large circular treatment.
+    draw:AddTriangleFilled(left, right, tip, shadow);
+    local inset = 1.35 * scale;
+    draw:AddTriangleFilled(
+        { left[1] + inset, left[2] + inset * 0.25 },
+        { right[1] - inset, right[2] + inset * 0.25 },
+        { tip[1], tip[2] - inset }, brass);
+    draw:AddCircleFilled(tip, (0.85 + urgency * 0.20) * scale, light, 8);
 end
 
 local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_blend)
@@ -2555,6 +2649,13 @@ local function keep_items_in_safe_area(items, viewport)
     end
 
     local extent = 30 * state.settings.scale;
+    for _, item in ipairs(items) do
+        if ((item.focus_blend or 0) > 0.01) then
+            -- Reserve the extra headroom used by the deployed expiry caret.
+            extent = 34 * state.settings.scale;
+            break;
+        end
+    end
     local min_x, min_y = math.huge, math.huge;
     local max_x, max_y = -math.huge, -math.huge;
     for _, item in ipairs(items) do
@@ -2660,6 +2761,19 @@ local function render()
     local focus_blend = smooth_deploy_focus(deployed, now);
     local items = build_render_items(
         anchor_x, anchor_y, now, overloaded, focus_blend);
+    local next_expiry_item = find_next_expiry_item(items, focus_blend);
+    if (next_expiry_item ~= nil) then
+        local remaining = math.max(0, next_expiry_item.slot.expires - now);
+        -- Preserve the normal deployed presentation until the final fifteen
+        -- seconds, then ease the priority hierarchy in over one second.
+        local reveal = clamp(15.0 - remaining, 0, 1) * focus_blend;
+        if (reveal > 0) then
+            for _, item in ipairs(items) do
+                item.expiry_contrast = reveal;
+            end
+            next_expiry_item.expiry_priority = reveal;
+        end
+    end
     keep_items_in_safe_area(items, viewport);
     if (state.settings.deploy_style == 'chevrons') then
         draw_deploy_chevrons(draw, items, focus_blend, now);
@@ -2672,6 +2786,7 @@ local function render()
     for _, item in ipairs(items) do
         draw_orb(draw, item, now);
     end
+    draw_next_expiry_marker(draw, next_expiry_item, focus_blend, now);
     draw_confirmation_flash(draw, items, now);
     draw_overload_flash(draw, anchor_x, anchor_y, now);
 end

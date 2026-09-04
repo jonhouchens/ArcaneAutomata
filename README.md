@@ -18,7 +18,22 @@ by PUPMan.
 
 ## Install
 
-Copy `arcaneautomata.lua` and `actionpacket.lua` into
+For a release build, extract `ArcaneAutomata-vX.Y.Z.zip` directly into the
+Ashita directory. The archive already places the addon and its shared Puppetmaster
+libraries in the expected locations:
+
+```text
+addons/
+|-- arcaneautomata/
+|   |-- arcaneautomata.lua
+|   `-- actionpacket.lua
+`-- libs/
+    |-- burdenmodel.lua
+    |-- burdenforecast.lua
+    `-- pupstats.lua
+```
+
+For a source install, copy `arcaneautomata.lua` and `actionpacket.lua` into
 `<Ashita>/addons/arcaneautomata/`. Then copy every Lua file from this
 repository's `libs/` directory into `<Ashita>/addons/libs/`.
 
@@ -167,6 +182,13 @@ colors only the lattice; `overload` previews the separate red failure state.
 - Timer rings use sixteen rune-like segments that extinguish with duration,
   aged brass at 15 seconds, and pulsing orange at 5 seconds. Approximate timers
   retain an alternating segment pattern.
+- While the automaton is deployed, the exact-timer ring that will expire next
+  becomes brighter and slightly heavier through carousel depth fading while
+  the other timer rings recede modestly, and it gains a compact downward pin.
+  This priority contrast stays completely hidden until the final 15 seconds,
+  then eases in over one second to avoid an abrupt pop. Cold-attached
+  approximate timers omit this hierarchy because their application order is
+  not known.
 - A small brass mote makes one clockwise lap around the full formation during
   the 10-second maneuver recast. It carries a short fading trail, flashes teal
   at twelve o'clock when ready, and then disappears completely. Use
@@ -233,6 +255,9 @@ colors only the lattice; `overload` previews the separate red failure state.
   o'clock during the carousel and becomes a compact local progress gauge so it
   cannot be confused with the orbiting maneuvers. `/aa deployorbit off` keeps
   the deploy focus and seals but disables the carousel.
+- Test-preview maneuvers are spaced by the normal 10-second shared recast, so
+  `/aa test on` followed by `/aa test deploy on` shows the deployed expiry
+  priority cue and three distinct timer states.
 - Once a successful server action's complete buff result is visible, the addon
   emits a short elemental ring with four pale locking ticks. Overload failures
   retain their separate warning flash. Use `/aa confirmflash off` to disable it.
@@ -250,8 +275,12 @@ colors only the lattice; `overload` previews the separate red failure state.
   Action results 798/799 anchor each elemental gauge, then the shared model applies
   the telemetry-fitted Horizon profile between observations: fresh burden 30
   at the assumed base threshold 30, normal-frame Dark gain 15, and one decay
-  per three-second tick. Unknown elements from a cold attach stay neutral until a
-  server result anchors them. For non-Dark Maneuvers, gain prediction compares
+  per three-second tick. Non-Dark gain is 20 below stat parity, 19/18/17 at
+  master-minus-pet differences 0/1/2, a telemetry-fitted 15 at difference 3,
+  and 14 at 4 or more. The difference-3 exception is based on repeated
+  fresh-pet Light Maneuvers from the 2026-08-26 DAD session. Unknown elements
+  from a cold attach stay neutral until a server result anchors them. For
+  non-Dark Maneuvers, gain prediction compares
   the master's live base-plus-gear stat with the automaton's exact
   base-plus-additional stat from PUP packet `0x44`. The pair is snapshotted on
   the outgoing Maneuver request so a fast aftercast swap does not contaminate

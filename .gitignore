@@ -8,5 +8,8 @@ Thumbs.db
 desktop.ini
 *.log
 
+# Locally generated release archives.
+dist/
+
 # Local standalone burden-model test harness.
 test_burdenmodel.lua
