@@ -1,6 +1,6 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '1.3.4';
+addon.version   = '1.3.5';
 addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
 
 require 'common';
@@ -118,6 +118,14 @@ local visual_presets = {
         style = 'orbit', radius = 72, height = 44, speed = 0.11,
         scale = 1.22, effects = true, smoothing = 0.16,
     },
+};
+
+-- Named scale steps make the display easy to tune for different resolutions
+-- while keeping /aa scale <number> available for precise adjustments.
+local scale_presets = {
+    small = 0.80,
+    medium = 1.00,
+    large = 1.25,
 };
 
 -- The outer recast mote is the precise clock. Lattice motion instead reflects
@@ -2821,8 +2829,9 @@ local function print_help()
         '/aa style crown | orbit',
         '/aa icons runes | crests | mechanical | toggle',
         '/aa preset taru | compact | cinematic',
+        '/aa size small | medium | large',
         '/aa radius <20-180> | height <10-140>',
-        '/aa speed <0.00-1.00> | scale <0.50-2.50>',
+        '/aa speed <0.00-1.00> | scale <0.50-2.50|small|medium|large>',
         '/aa offset <-500..500> - negative moves above the origin',
         '/aa idleoffset <-200..200> - added only while not engaged',
         '/aa timers on | off',
@@ -2999,6 +3008,22 @@ ashita.events.register('command', 'command_cb', function(e)
             return;
         end
         message('Visual preset: ' .. preset .. '.');
+    elseif (command == 'size'
+        or (command == 'scale' and tonumber(args[3]) == nil)) then
+        local size = string.lower(args[3] or '');
+        if (size == 'med') then
+            size = 'medium';
+        end
+        local scale = scale_presets[size];
+        if (scale == nil) then
+            error_message(
+                'Use /aa size small, medium, or large; '
+                .. 'or /aa scale <0.50-2.50>.');
+            return;
+        end
+        state.settings.scale = scale;
+        message(string.format(
+            'Display size: %s (scale %.2f).', size, scale));
     elseif (command == 'deploystyle') then
         local style = string.lower(args[3] or '');
         if (style ~= 'seals' and style ~= 'chevrons') then

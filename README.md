@@ -61,10 +61,16 @@ The primary short command is `/aa`. The previous `/po`, `/puporbit`,
 /aa preset taru
 /aa preset compact
 /aa preset cinematic
+/aa size small
+/aa size medium
+/aa size large
 /aa radius 55
 /aa height 35
 /aa speed 0.15
 /aa scale 1.0
+/aa scale small
+/aa scale medium
+/aa scale large
 /aa offset -120
 /aa idleoffset 18
 /aa timers on
@@ -133,6 +139,11 @@ The primary short command is `/aa`. The previous `/po`, `/puporbit`,
 ```
 
 Settings persist per Ashita profile. Maneuver state is intentionally transient.
+Use `/aa size small`, `/aa size medium`, or `/aa size large` to set the whole
+display to 0.80x, 1.00x, or 1.25x. `/aa scale` accepts the same names (including
+`med` as shorthand) or any numeric value from 0.50 to 2.50 for finer control.
+The named sizes scale the icons, spacing, rings, and effects together, making
+them useful when moving between lower- and higher-resolution displays.
 Vertical placement is screen-relative: negative offsets move the formation
 above the character's model origin and positive offsets move it downward. The
 accepted range is -500 to 500 pixels, allowing per-race and per-camera tuning.
