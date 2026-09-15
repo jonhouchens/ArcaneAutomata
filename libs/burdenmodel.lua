@@ -1,5 +1,5 @@
 --[[
-burdenmodel.lua (v2.6) — standalone PUP burden/overload library for Ashita v4
+burdenmodel.lua (v2.7) — standalone PUP burden/overload library for Ashita v4
 Install: Ashita/addons/libs/burdenmodel.lua
 Usage from any addon:
 
@@ -78,7 +78,7 @@ UNSUPPORTED / OUT OF SCOPE
 ]]
 
 local lib = {}
-lib.VERSION = '2.6'
+lib.VERSION = '2.7'
 
 --------------------------------------------------------------------------
 -- constants (exported for other addons)
@@ -188,6 +188,8 @@ Model.__index = Model
 --   extra_decay     : additional BURDEN_DECAY beyond Heatsink (default 0)
 --   gain_divisor    : integer divisor on maneuver gain (default 1;
 --                     3 approximates Kenkonken SUPPRESS_OVERLOAD)
+--   assume_fresh_on_cold_attach : seed all gauges at the Activate baseline
+--                     when an existing pet is first observed (default false)
 --   now             : clock function returning seconds (default os.clock)
 function lib.new(cfg)
     local self = setmetatable({}, Model)
@@ -295,6 +297,7 @@ function Model:configure(cfg)
         stat_diff = self.stat_diff,
         extra_decay = self.extra_decay,
         gain_divisor = self.gain_divisor,
+        assume_fresh_on_cold_attach = self.assume_fresh_on_cold_attach,
         now = self.now,
     } or nil
     if cfg.thresh_gear     ~= nil then self.thresh_gear     = cfg.thresh_gear end
@@ -303,12 +306,18 @@ function Model:configure(cfg)
     if cfg.stat_diff       ~= nil then self.stat_diff       = cfg.stat_diff end
     if cfg.extra_decay     ~= nil then self.extra_decay     = cfg.extra_decay end
     if cfg.gain_divisor    ~= nil then self.gain_divisor    = cfg.gain_divisor end
+    if cfg.assume_fresh_on_cold_attach ~= nil then
+        self.assume_fresh_on_cold_attach = cfg.assume_fresh_on_cold_attach == true
+    end
     if cfg.now             ~= nil then self.now             = cfg.now end
     self.thresh_gear  = self.thresh_gear  or 0
     self.heatsink     = self.heatsink     or false
     self.extra_decay  = math.max(self.extra_decay or 0, 0)
     self.gain_divisor = math.max(math.floor(self.gain_divisor or 1), 1)
     if self.frame_half_dark == nil then self.frame_half_dark = false end
+    if self.assume_fresh_on_cold_attach == nil then
+        self.assume_fresh_on_cold_attach = false
+    end
     local changed = initialized and (
         previous.thresh_gear ~= self.thresh_gear
         or previous.heatsink ~= self.heatsink
@@ -316,6 +325,8 @@ function Model:configure(cfg)
         or previous.stat_diff ~= self.stat_diff
         or previous.extra_decay ~= self.extra_decay
         or previous.gain_divisor ~= self.gain_divisor
+        or previous.assume_fresh_on_cold_attach
+            ~= self.assume_fresh_on_cold_attach
         or previous.now ~= self.now)
     if changed then self:_emit_telemetry('configure') end
 end
@@ -377,16 +388,27 @@ function Model:on_activate()
     -- master, not the pet.
 end
 
--- Library loaded while the automaton is already out: state is genuinely
--- unknown. Track time/decay, report nil until 798/799 anchors an element.
+-- Library loaded while the automaton is already out. Consumers may explicitly
+-- choose the fresh-Activate baseline as a useful login/zone default; keep its
+-- quality estimated because no Activate packet was observed in this session.
 function Model:on_cold_attach()
-    for e = 0, 7 do
-        self.gauge[e]   = nil
-        self.quality[e] = lib.QUALITY.UNKNOWN
+    if self.assume_fresh_on_cold_attach then
+        for e = 0, 7 do
+            self.gauge[e]   = SPAWN_BURDEN
+            self.quality[e] = lib.QUALITY.ESTIMATE
+        end
+    else
+        for e = 0, 7 do
+            self.gauge[e]   = nil
+            self.quality[e] = lib.QUALITY.UNKNOWN
+        end
     end
     self.active    = true
     self.last_tick = self.now()
-    self:_emit_telemetry('cold_attach')
+    self:_emit_telemetry('cold_attach', {
+        note = self.assume_fresh_on_cold_attach
+            and 'assumed_activate_baseline' or 'unknown_baseline',
+    })
 end
 
 -- Deactivate / pet death / release: server discards the pet entity.
@@ -691,6 +713,13 @@ function lib.attach(cfg)
     model._pet_missing_since = nil
 
     ashita.events.register('packet_in', model._alias_packet, function(e)
+        if e.id == 0x0A or e.id == 0x0B then
+            -- Zone/login state invalidates every gauge derived in the prior
+            -- area. The next observed pet takes the configured cold baseline.
+            model:on_deactivate()
+            model._pet_missing_since = nil
+            return
+        end
         if e.id ~= 0x28 then return end
         local ok, act = pcall(lib.parse_action, e.data)
         if not ok or act == nil then
@@ -795,7 +824,7 @@ function lib.attach(cfg)
                     model._pet_missing_since = nil
                 end
             elseif pet_out then
-                -- Loaded while the automaton was already active: unknown state.
+                -- Loaded or zoned while the automaton was already active.
                 model:on_cold_attach()
             end
         end

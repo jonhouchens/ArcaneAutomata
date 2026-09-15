@@ -25,6 +25,7 @@ $archivePath = Join-Path $outputPath "ArcaneAutomata-v$version.zip"
 
 $archiveFiles = @(
     @{ Source = 'arcaneautomata.lua'; Entry = 'addons/arcaneautomata/arcaneautomata.lua' }
+    @{ Source = 'maneuverview.lua'; Entry = 'addons/arcaneautomata/maneuverview.lua' }
     @{ Source = 'actionpacket.lua'; Entry = 'addons/arcaneautomata/actionpacket.lua' }
     @{ Source = 'README.md'; Entry = 'addons/arcaneautomata/README.md' }
     @{ Source = 'LICENSE'; Entry = 'addons/arcaneautomata/LICENSE' }

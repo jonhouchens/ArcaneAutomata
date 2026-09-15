@@ -1,6 +1,6 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '1.3.5';
+addon.version   = '1.4.0';
 addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
 
 require 'common';
@@ -8,6 +8,7 @@ require 'common';
 local actionpacket = require 'actionpacket';
 local burden       = require 'burdenmodel';
 local forecast     = require 'burdenforecast';
+local maneuverview = require 'maneuverview';
 local pupstats     = require 'pupstats';
 local chat         = require 'chat';
 local d3d8         = require 'd3d8';
@@ -25,7 +26,6 @@ local MANEUVER_RESOURCE_OFFSET = 512;
 local MANEUVER_RECAST_SECONDS = 10;
 local MANEUVER_SYNC_TIMEOUT = 2.5;
 local MANEUVER_ABORT_TIMEOUT = 5.0;
-local OVERLOAD_BUFF_ID = 299;
 local ORIGIN_WORLD_LIFT = 0.10;
 local TAU = math.pi * 2;
 local TRANSITION_SECONDS = 0.28;
@@ -169,11 +169,10 @@ local state = {
     fading_slots = {},
     overload_flash = nil,
     confirmation_flash = nil,
-    last_sync = -1,
     last_action = -10,
     recast_was_active = false,
     recast_ready_at = -10,
-    pending_sync = nil,
+    pending_confirmation = nil,
     was_pup = false,
     was_alive = false,
     was_zoning = false,
@@ -303,6 +302,7 @@ end
 
 local burden_model = burden.attach({
     alias = 'arcaneautomata_burden',
+    assume_fresh_on_cold_attach = true,
     thresh_gear = state.settings.burden_threshold,
     heatsink = effective_heatsink(),
     frame_half_dark = effective_half_dark(),
@@ -337,7 +337,7 @@ local function clear_slots()
     state.fading_slots = {};
     state.overload_flash = nil;
     state.confirmation_flash = nil;
-    state.pending_sync = nil;
+    state.pending_confirmation = nil;
     state.recast_was_active = false;
     state.recast_ready_at = -10;
     state.anchor_x = nil;
@@ -375,7 +375,7 @@ local function ensure_test_slots(force)
 
     state.slots = {};
     state.fading_slots = {};
-    state.pending_sync = nil;
+    state.pending_confirmation = nil;
     for index = 1, count do
         local element = by_name[string.lower(
             state.settings.test_elements[index])];
@@ -391,7 +391,6 @@ local function ensure_test_slots(force)
             test_preview = true,
         });
     end
-    state.last_sync = now;
 end
 
 local function is_event_system_active()
@@ -461,23 +460,29 @@ local function automaton_is_deployed()
     return pet ~= nil and (pet.Status or 0) == 1;
 end
 
-local function current_buff_counts()
-    local counts = {};
-    local overloaded = false;
-    local player = AshitaCore:GetMemoryManager():GetPlayer();
-    if (player == nil) then
-        return counts, overloaded;
-    end
+local function current_maneuver_view()
+    return maneuverview.read({ now = clock_seconds() });
+end
 
-    for _, buff_id in pairs(player:GetBuffs()) do
-        local element = by_buff[buff_id];
-        if (buff_id == OVERLOAD_BUFF_ID) then
-            overloaded = true;
-        elseif (element ~= nil) then
-            counts[element.name] = (counts[element.name] or 0) + 1;
-        end
+local function current_buff_counts()
+    local view = current_maneuver_view();
+    return view.counts, view.overloaded;
+end
+
+local function native_view_text()
+    local view = current_maneuver_view();
+    if (view.error ~= nil) then return 'Native view error: ' .. view.error; end
+    local parts = {};
+    for _, instance in ipairs(view.maneuvers) do
+        parts[#parts + 1] = ('%s[i%d]=%s'):fmt(
+            instance.name,
+            instance.buff_index,
+            instance.remaining ~= nil
+                and (tostring(instance.remaining) .. 's') or '?');
     end
-    return counts, overloaded;
+    if (#parts == 0) then parts[1] = 'none'; end
+    return ('Ashita maneuvers: %s | overload=%s'):fmt(
+        table.concat(parts, ', '), tostring(view.overloaded));
 end
 
 local function game_maneuver_recast()
@@ -516,24 +521,6 @@ local function tracked_counts()
     return counts;
 end
 
-local function maneuver_count_total(counts)
-    local count = 0;
-    for _, value in pairs(counts) do
-        count = count + value;
-    end
-    return count;
-end
-
-local function maneuver_counts_equal(left, right)
-    for ability_id = MANEUVER_MIN_ID, MANEUVER_MAX_ID do
-        local name = elements[ability_id].name;
-        if ((left[name] or 0) ~= (right[name] or 0)) then
-            return false;
-        end
-    end
-    return true;
-end
-
 local function begin_layout_transition(now)
     if (not state.settings.transitions) then
         return;
@@ -560,237 +547,95 @@ local function fade_slot(slot, now)
     end
 end
 
-local function retire_slot(index, now)
-    local slot = table.remove(state.slots, index);
-    begin_layout_transition(now);
-    fade_slot(slot, now);
-end
+-- Rebuild AA's cosmetic orb objects from one current Ashita memory view. The
+-- orb objects retain layout/animation fields only; they never retain authority
+-- over maneuver membership or lifetime.
+local function sync_visual_slots(view)
+    local now = view.read_at or clock_seconds();
+    local previous = state.slots;
+    local used = {};
+    local next_slots = {};
 
-local function earliest_slot_index(name)
-    local selected_index = nil;
-    local selected_expiry = math.huge;
-    for index, slot in ipairs(state.slots) do
-        if ((name == nil or slot.name == name)
-            and slot.expires < selected_expiry) then
-            selected_index = index;
-            selected_expiry = slot.expires;
+    local function find_match(instance, exact_only)
+        local best_index = nil;
+        local best_distance = math.huge;
+        for index, slot in ipairs(previous) do
+            if (not used[index] and slot.name == instance.name) then
+                local exact = slot.source_raw_timer ~= nil
+                    and slot.source_raw_timer == instance.raw_timer;
+                if (exact) then return index, false; end
+                if (not exact_only) then
+                    local distance = slot.expires ~= nil
+                        and instance.expires ~= nil
+                        and math.abs(slot.expires - instance.expires)
+                        or index;
+                    if (distance < best_distance) then
+                        best_index, best_distance = index, distance;
+                    end
+                end
+            end
         end
-    end
-    return selected_index;
-end
-
-local function record_maneuver(element, approximate, started)
-    if (element == nil) then
-        return nil;
-    end
-    local now = clock_seconds();
-    local action_started = started or now;
-    local slot = {
-        name = element.name,
-        ability = element.ability,
-        started = action_started,
-        appeared = now,
-        expires = action_started + MANEUVER_DURATION,
-        approximate = approximate == true,
-    };
-
-    if (#state.slots >= 3) then
-        local replace_index = earliest_slot_index();
-        local replaced = state.slots[replace_index];
-        if (replaced.name == element.name) then
-            -- Refresh the matching visual in place. Its timer and activation
-            -- ripple restart, but the orb itself never disappears or moves.
-            replaced.started = slot.started;
-            replaced.expires = slot.expires;
-            replaced.approximate = slot.approximate;
-            return replaced;
-        end
-
-        -- Crossfade a different element in the exact slot that the game
-        -- replaces, keeping the other two visuals completely stable.
-        fade_slot(replaced, now);
-        state.slots[replace_index] = slot;
-        return slot;
+        return best_index, best_index ~= nil;
     end
 
-    begin_layout_transition(now);
-    table.insert(state.slots, slot);
-    return slot;
-end
-
-local function apply_pending_maneuver(pending, actual, now)
-    local before = pending.before_counts;
-    local element = pending.element;
-    local unchanged = maneuver_counts_equal(actual, before);
-    local before_total = maneuver_count_total(before);
-    local slot = nil;
-
-    if (before_total >= 3 and unchanged) then
-        -- Counts cannot identify which duplicate was refreshed. The server
-        -- result proves that an instance of this element was replaced, so
-        -- refresh the earliest matching visual and leave every other element
-        -- untouched.
-        local index = earliest_slot_index(element.name);
-        slot = index ~= nil and state.slots[index] or nil;
-        if (slot ~= nil) then
-            slot.started = pending.seen;
-            slot.expires = pending.seen + MANEUVER_DURATION;
-            slot.approximate = false;
-        end
-    elseif (before_total >= 3) then
-        local replaced_name = nil;
-        for ability_id = MANEUVER_MIN_ID, MANEUVER_MAX_ID do
-            local name = elements[ability_id].name;
-            if ((before[name] or 0) > (actual[name] or 0)) then
-                replaced_name = name;
+    local changed_layout = #previous ~= #view.maneuvers;
+    if (not changed_layout) then
+        for index, instance in ipairs(view.maneuvers) do
+            local slot = previous[index];
+            if (slot == nil or slot.name ~= instance.name
+                or slot.source_raw_timer ~= instance.raw_timer) then
+                changed_layout = true;
                 break;
             end
         end
+    end
+    if (changed_layout) then begin_layout_transition(now); end
 
-        local index = replaced_name ~= nil
-            and earliest_slot_index(replaced_name) or nil;
-        if (index ~= nil) then
-            local replaced = state.slots[index];
+    for _, instance in ipairs(view.maneuvers) do
+        local match_index, refreshed = find_match(instance, false);
+        local slot = match_index ~= nil and previous[match_index] or nil;
+        if (slot ~= nil) then used[match_index] = true; end
+
+        if (slot == nil) then
+            local element = by_name[string.lower(instance.name)];
             slot = {
-                name = element.name,
+                name = instance.name,
                 ability = element.ability,
-                started = pending.seen,
                 appeared = now,
-                expires = pending.seen + MANEUVER_DURATION,
-                approximate = false,
             };
-            fade_slot(replaced, now);
-            state.slots[index] = slot;
+            refreshed = true;
         end
-    end
 
-    if (slot == nil) then
-        slot = record_maneuver(element, false, pending.seen);
-    end
-    if (state.settings.confirmation_flash and slot ~= nil) then
-        state.confirmation_flash = {
-            slot = slot,
-            started = now,
-        };
-    end
-end
+        -- Preserve the local presentation clock while Ashita's absolute raw
+        -- timer is unchanged. This keeps the ring smooth between native
+        -- one-second timer updates without granting the visual any authority
+        -- over whether the maneuver still exists.
+        if (refreshed or slot.expires == nil) then
+            slot.started = instance.started or now;
+            slot.expires = instance.expires or now;
+        end
+        slot.approximate = instance.approximate;
+        slot.buff_index = instance.buff_index;
+        slot.source_raw_timer = instance.raw_timer;
+        table.insert(next_slots, slot);
 
-local function confirm_maneuver_slot(slot, now)
-    if (state.settings.confirmation_flash and slot ~= nil) then
-        state.confirmation_flash = {
-            slot = slot,
-            started = now,
-        };
-    end
-end
-
-local function apply_immediate_maneuver(element, before_counts, now)
-    local before_total = maneuver_count_total(before_counts);
-    if (before_total < 3) then
-        -- A successful action below the maneuver cap can only add a new
-        -- instance, so there is no replacement ambiguity to reconcile.
-        return record_maneuver(element, false, now);
-    end
-
-    local replace_index = earliest_slot_index();
-    local replaced = replace_index ~= nil and state.slots[replace_index] or nil;
-    if (replaced ~= nil and not replaced.approximate) then
-        -- Exact timers identify the instance the game will replace. Apply the
-        -- successful action immediately and let record_maneuver either refresh
-        -- a matching orb or replace a different element in the same position.
-        return record_maneuver(element, false, now);
-    end
-
-    return nil;
-end
-
-local function reconcile_slots(force)
-    local now = clock_seconds();
-    if (not force and now - state.last_sync < 0.25) then
-        return;
-    end
-    state.last_sync = now;
-
-    local actual = current_buff_counts();
-    local pending = state.pending_sync;
-    if (not force and pending ~= nil) then
-        local elapsed = now - pending.seen;
-        local before = pending.before_counts;
-        local before_total = maneuver_count_total(before);
-        local expected_total = math.min(3, before_total + 1);
-        local actual_total = maneuver_count_total(actual);
-        local new_count_increased = (actual[pending.element.name] or 0)
-            > (before[pending.element.name] or 0);
-        local observed_complete = actual_total == expected_total
-            and new_count_increased;
-        local unchanged = maneuver_counts_equal(actual, before);
-        local unchanged_refresh = unchanged and before_total >= 3
-            and (before[pending.element.name] or 0) > 0;
-
-        if (observed_complete) then
-            -- Require the complete result on two reconciliation passes. This
-            -- prevents a torn memory read from committing a plausible but
-            -- transient three-buff snapshot.
-            if (pending.observed_counts == nil
-                or not maneuver_counts_equal(
-                    actual, pending.observed_counts)) then
-                pending.observed_counts = actual;
-                pending.observed_at = now;
-                return;
-            elseif (now - pending.observed_at < 0.20) then
-                return;
+        local pending = state.pending_confirmation;
+        if (refreshed and pending ~= nil and pending.name == slot.name
+            and now - pending.seen <= MANEUVER_SYNC_TIMEOUT) then
+            if (state.settings.confirmation_flash) then
+                state.confirmation_flash = { slot = slot, started = now };
             end
-        elseif (not unchanged_refresh or elapsed < MANEUVER_SYNC_TIMEOUT) then
-            pending.observed_counts = nil;
-            pending.observed_at = nil;
-            -- Ignore both the unchanged pre-action snapshot and any partial
-            -- remove/add snapshots. Nothing visual changes until the complete
-            -- post-action state is available.
-            if (elapsed < MANEUVER_ABORT_TIMEOUT) then
-                return;
-            end
-            -- A successful action should settle well before this point. If it
-            -- does not, abandon the transaction and let ordinary buff
-            -- reconciliation recover from the one current snapshot.
-            state.pending_sync = nil;
-            pending = nil;
-        end
-
-        if (pending ~= nil) then
-            state.pending_sync = nil;
-            apply_pending_maneuver(pending, actual, now);
-            return;
-        end
-    elseif (not force and now - state.last_action < 1.0) then
-        -- Overload failures have no provisional maneuver, but their action can
-        -- still arrive before the client buff list settles.
-        return;
-    end
-    local tracked = tracked_counts();
-
-    -- Buff loss is authoritative. Remove the earliest-expiring matching
-    -- instance first so duplicate timers remain aligned with replacement rules.
-    for name, count in pairs(tracked) do
-        local excess = count - (actual[name] or 0);
-        while (excess > 0) do
-            local index = earliest_slot_index(name);
-            if (index ~= nil) then
-                retire_slot(index, now);
-            end
-            excess = excess - 1;
+            state.pending_confirmation = nil;
         end
     end
 
-    tracked = tracked_counts();
-    -- The original activation order cannot be recovered on addon load. Use a
-    -- deterministic elemental order and mark every discovered timer approximate.
-    for ability_id = MANEUVER_MIN_ID, MANEUVER_MAX_ID do
-        local element = elements[ability_id];
-        local missing = (actual[element.name] or 0) - (tracked[element.name] or 0);
-        while (missing > 0) do
-            record_maneuver(element, true);
-            missing = missing - 1;
-        end
+    for index, slot in ipairs(previous) do
+        if (not used[index]) then fade_slot(slot, now); end
+    end
+    state.slots = next_slots;
+    if (state.pending_confirmation ~= nil
+        and now - state.pending_confirmation.seen > MANEUVER_ABORT_TIMEOUT) then
+        state.pending_confirmation = nil;
     end
 end
 
@@ -2721,10 +2566,12 @@ local function render()
     state.was_pup = is_pup;
     state.was_alive = true;
     state.was_zoning = false;
+    local live_view = nil;
     if (preview) then
         ensure_test_slots(false);
     else
-        reconcile_slots(false);
+        live_view = current_maneuver_view();
+        sync_visual_slots(live_view);
     end
     if (not state.settings.enabled
         or (#state.slots == 0 and #state.fading_slots == 0)) then
@@ -2756,7 +2603,7 @@ local function render()
         return;
     end
 
-    local _, overloaded = current_buff_counts();
+    local overloaded = live_view ~= nil and live_view.overloaded or false;
     if (preview) then
         overloaded = state.settings.test_risk == 'OVERLOAD';
     end
@@ -2826,6 +2673,7 @@ end
 local function print_help()
     local lines = {
         '/aa on | off | toggle',
+        '/aa native - print Ashita buff indexes and timers',
         '/aa style crown | orbit',
         '/aa icons runes | crests | mechanical | toggle',
         '/aa preset taru | compact | cinematic',
@@ -2880,7 +2728,7 @@ ashita.events.register('load', 'load_cb', function()
     if (state.settings.test_mode) then
         ensure_test_slots(true);
     else
-        reconcile_slots(true);
+        sync_visual_slots(current_maneuver_view());
     end
     settings.save();
     if (state.settings.test_mode) then
@@ -2900,7 +2748,6 @@ end);
 ashita.events.register('packet_in', 'packet_in_cb', function(e)
     if (e.id == 0x000A or e.id == 0x000B) then
         clear_slots();
-        state.last_sync = -1;
         return;
     end
 
@@ -2929,24 +2776,17 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             -- 798 is a successful maneuver. 799 is an overload failure.
             if (action.Message == 798) then
                 local now = clock_seconds();
-                local before_counts = tracked_counts();
                 state.last_action = now;
-                local immediate_slot = apply_immediate_maneuver(
-                    element, before_counts, now);
-                if (immediate_slot ~= nil) then
-                    state.pending_sync = nil;
-                    confirm_maneuver_slot(immediate_slot, now);
-                else
-                    state.pending_sync = {
-                        element = element,
-                        before_counts = before_counts,
-                        seen = now,
-                    };
-                end
+                -- The packet drives only the confirmation effect. Membership
+                -- and the refreshed timer arrive through Ashita's buff memory.
+                state.pending_confirmation = {
+                    name = element.name,
+                    seen = now,
+                };
                 return;
             elseif (action.Message == 799) then
                 state.last_action = clock_seconds();
-                state.pending_sync = nil;
+                state.pending_confirmation = nil;
                 state.overload_flash = {
                     ability = element.ability,
                     started = state.last_action,
@@ -2972,7 +2812,9 @@ ashita.events.register('command', 'command_cb', function(e)
     e.blocked = true;
 
     local command = string.lower(args[2] or 'toggle');
-    if (command == 'on' or command == 'off' or command == 'toggle') then
+    if (command == 'native') then
+        message(native_view_text());
+    elseif (command == 'on' or command == 'off' or command == 'toggle') then
         state.settings.enabled = parse_switch(command, state.settings.enabled);
         message('Display: ' .. (state.settings.enabled and 'on.' or 'off.'));
     elseif (command == 'style') then
@@ -3155,7 +2997,6 @@ ashita.events.register('command', 'command_cb', function(e)
             local enabled = parse_switch(option, state.settings.test_mode);
             state.settings.test_mode = enabled;
             clear_slots();
-            state.last_sync = -1;
             if (enabled) then
                 state.settings.enabled = true;
                 ensure_test_slots(true);
@@ -3278,8 +3119,7 @@ ashita.events.register('command', 'command_cb', function(e)
         ensure_settings_shape();
         configure_burden_model();
         clear_slots();
-        state.last_sync = -1;
-        message('Settings and tracked timers reset.');
+        message('Settings reset. Maneuvers are read directly from Ashita.');
     elseif (command == 'help') then
         print_help();
     else

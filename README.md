@@ -26,6 +26,7 @@ libraries in the expected locations:
 addons/
 |-- arcaneautomata/
 |   |-- arcaneautomata.lua
+|   |-- maneuverview.lua
 |   `-- actionpacket.lua
 `-- libs/
     |-- burdenmodel.lua
@@ -33,7 +34,7 @@ addons/
     `-- pupstats.lua
 ```
 
-For a source install, copy `arcaneautomata.lua` and `actionpacket.lua` into
+For a source install, copy `arcaneautomata.lua`, `maneuverview.lua`, and `actionpacket.lua` into
 `<Ashita>/addons/arcaneautomata/`. Then copy every Lua file from this
 repository's `libs/` directory into `<Ashita>/addons/libs/`.
 
@@ -52,6 +53,7 @@ The primary short command is `/aa`. The previous `/po`, `/puporbit`,
 /aa on
 /aa off
 /aa toggle
+/aa native
 /aa style crown
 /aa style orbit
 /aa icons runes
@@ -178,18 +180,16 @@ colors only the lattice; `overload` previews the separate red failure state.
 
 ## Display behavior
 
-- Buffs 300-307 are reconciled with action packet IDs 141-148.
-- Successful action packets open an atomic update. The addon ignores partial
-  removal/addition snapshots and changes the formation once the complete buff
-  result is visible. At three stacks, an unchanged result refreshes the
-  earliest matching element in place without disturbing the other maneuvers.
+- Buffs 300-307 and their paired per-instance timers are read directly from
+  Ashita's current `GetBuffs()` / `GetStatusTimers()` arrays every render frame.
+- Action packet IDs 141-148 drive burden updates and confirmation effects, but
+  never create, remove, refresh, or expire maneuver state.
 - Each active instance gets its own orb, including duplicate maneuvers.
-- At three active maneuvers, the orb with the least duration remaining is
-  replaced in place. Reapplying that same element refreshes the existing orb
-  without moving the other two.
-- Packet-observed maneuvers receive exact 60-second timers.
-- Maneuvers found on load receive dotted approximate timer rings because the
-  original application time is not exposed by the normal buff list.
+- At three active maneuvers, native timer changes identify replacements and
+  same-element refreshes without reconstructing an activation queue.
+- Maneuvers found on load receive their current native timers immediately.
+- Economizer, Flame Holder, Overload, and other consumers need no special-case
+  state changes; AA reflects the next Ashita buff snapshot.
 - Timer rings use sixteen rune-like segments that extinguish with duration,
   aged brass at 15 seconds, and pulsing orange at 5 seconds. Approximate timers
   retain an alternating segment pattern.
@@ -197,9 +197,8 @@ colors only the lattice; `overload` previews the separate red failure state.
   becomes brighter and slightly heavier through carousel depth fading while
   the other timer rings recede modestly, and it gains a compact downward pin.
   This priority contrast stays completely hidden until the final 15 seconds,
-  then eases in over one second to avoid an abrupt pop. Cold-attached
-  approximate timers omit this hierarchy because their application order is
-  not known.
+  then eases in over one second to avoid an abrupt pop. If Ashita cannot expose
+  a plausible timer, the affected dotted ring omits this hierarchy.
 - A small brass mote makes one clockwise lap around the full formation during
   the 10-second maneuver recast. It carries a short fading trail, flashes teal
   at twelve o'clock when ready, and then disappears completely. Use
@@ -240,8 +239,9 @@ colors only the lattice; `overload` previews the separate red failure state.
   `LOW` risk below 20%, an amber circuit of
   about 3.5 seconds at `WARM`, and two-second orange energy at `DANGER`. Only
   `OVERLOAD` uses red, fracturing the orderly circuit into irregular sparks.
-  Cold-attached `UNKNOWN` state uses a quiet neutral-gray circuit instead of
-  implying safety. `/aa burden off` leaves the lattice in its calm `SAFE`
+  A cold-attached or post-zone automaton starts from the estimated
+  Activate-equivalent burden baseline; genuinely unavailable risk uses a quiet
+  neutral-gray circuit. `/aa burden off` leaves the lattice in its calm `SAFE`
   presentation.
 - Maneuvers bloom in with an elemental ripple and dissolve when their buff is
   lost. As the formation changes, surviving orbs glide into their new slots.
@@ -289,8 +289,10 @@ colors only the lattice; `overload` previews the separate red failure state.
   per three-second tick. Non-Dark gain is 20 below stat parity, 19/18/17 at
   master-minus-pet differences 0/1/2, a telemetry-fitted 15 at difference 3,
   and 14 at 4 or more. The difference-3 exception is based on repeated
-  fresh-pet Light Maneuvers from the 2026-08-26 DAD session. Unknown elements
-  from a cold attach stay neutral until a server result anchors them. For
+  fresh-pet Light Maneuvers from the 2026-08-26 DAD session. On login, addon
+  reload, or zoning with an automaton already present, all elements start at
+  the 30-point Activate baseline with `estimate` quality. Server results then
+  anchor each used element normally. For
   non-Dark Maneuvers, gain prediction compares
   the master's live base-plus-gear stat with the automaton's exact
   base-plus-additional stat from PUP packet `0x44`. The pair is snapshotted on
