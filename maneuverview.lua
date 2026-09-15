@@ -12,6 +12,7 @@ local OVERLOAD_BUFF_ID = 299;
 local FIRST_MANEUVER_BUFF_ID = 300;
 local LAST_MANEUVER_BUFF_ID = 307;
 local MANEUVER_DURATION_SECONDS = 60;
+local MAX_ACTIVE_MANEUVERS = 3;
 local INFINITE_DURATION = 0x7FFFFFFF;
 local VANA_BASE_STAMP = 0x3C307D70;
 local UINT32 = 0x100000000;
@@ -39,6 +40,8 @@ local function empty_view(now, error_text)
         oldest = nil,
         overloaded = false,
         timer_available = false,
+        raw_maneuver_count = 0,
+        trimmed_maneuver_count = 0,
         error = error_text,
     };
 end
@@ -128,7 +131,6 @@ function lib.from_arrays(buffs, timers, options)
                     and (now + remaining - MANEUVER_DURATION_SECONDS) or nil,
                 approximate = not timer_valid,
             };
-            view.counts[name] = (view.counts[name] or 0) + 1;
             table.insert(view.maneuvers, instance);
             if (timer_valid) then view.timer_available = true; end
         end
@@ -142,6 +144,22 @@ function lib.from_arrays(buffs, timers, options)
         end
         return left.buff_index < right.buff_index;
     end);
+
+    -- When a fourth maneuver replaces the oldest, Ashita can expose the new
+    -- buff one frame before clearing the outgoing buff slot. Normalize that
+    -- transient snapshot to the game's three-maneuver cap immediately. Since
+    -- the list is expiration-ordered, the outgoing oldest instance is first.
+    view.raw_maneuver_count = #view.maneuvers;
+    while (#view.maneuvers > MAX_ACTIVE_MANEUVERS) do
+        table.remove(view.maneuvers, 1);
+        view.trimmed_maneuver_count = view.trimmed_maneuver_count + 1;
+    end
+
+    view.timer_available = false;
+    for _, instance in ipairs(view.maneuvers) do
+        view.counts[instance.name] = (view.counts[instance.name] or 0) + 1;
+        if (not instance.approximate) then view.timer_available = true; end
+    end
     view.oldest = view.maneuvers[1];
     return view;
 end

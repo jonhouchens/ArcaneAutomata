@@ -186,7 +186,9 @@ colors only the lattice; `overload` previews the separate red failure state.
   never create, remove, refresh, or expire maneuver state.
 - Each active instance gets its own orb, including duplicate maneuvers.
 - At three active maneuvers, native timer changes identify replacements and
-  same-element refreshes without reconstructing an activation queue.
+  same-element refreshes without reconstructing an activation queue. Ashita's
+  transient four-buff replacement frame is normalized immediately by dropping
+  the earliest-expiring outgoing instance.
 - Maneuvers found on load receive their current native timers immediately.
 - Economizer, Flame Holder, Overload, and other consumers need no special-case
   state changes; AA reflects the next Ashita buff snapshot.
@@ -244,7 +246,10 @@ colors only the lattice; `overload` previews the separate red failure state.
   neutral-gray circuit. `/aa burden off` leaves the lattice in its calm `SAFE`
   presentation.
 - Maneuvers bloom in with an elemental ripple and dissolve when their buff is
-  lost. As the formation changes, surviving orbs glide into their new slots.
+  lost. A full three-maneuver replacement suppresses the outgoing dissolve so
+  the display never shows four orbs. The incoming orb inherits the outgoing
+  orb's formation position, preserving the continuous deploy orbit and seal
+  phase. As the formation size changes, surviving orbs glide into new slots.
   `/aa transitions off` restores immediate appearance and removal.
 - When the automaton's entity enters its deployed combat state, `/aa deployfx on`
   tightens the formation by eight percent, slightly compresses its height, and

@@ -50,6 +50,22 @@ equal(initial.oldest.name, 'Dark', 'oldest element');
 equal(initial.oldest.remaining, 42, 'oldest remaining');
 equal(#initial.maneuvers, 3, 'initial total');
 
+-- Ashita can briefly publish the incoming fourth maneuver before clearing the
+-- outgoing oldest slot. The reader must expose the post-replacement set in the
+-- same frame instead of allowing consumers to render or plan around four.
+local replacement = view({
+    { 2, 300, 12 }, -- outgoing Fire
+    { 5, 301, 31 }, -- Ice
+    { 8, 302, 47 }, -- Wind
+    { 12, 303, 60 }, -- incoming Earth
+});
+equal(replacement.raw_maneuver_count, 4, 'replacement raw total');
+equal(replacement.trimmed_maneuver_count, 1, 'replacement trimmed total');
+equal(#replacement.maneuvers, 3, 'replacement active total');
+equal(replacement.counts.Fire, nil, 'replacement removed oldest');
+equal(replacement.counts.Earth, 1, 'replacement retained incoming');
+equal(replacement.oldest.name, 'Ice', 'replacement next expiry');
+
 -- Economizer behavior requires no action-specific mutation: Ashita's next
 -- snapshot simply contains no Dark instances.
 local economizer = view({ { 8, 305, 50 } });

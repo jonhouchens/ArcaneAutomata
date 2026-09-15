@@ -1,6 +1,6 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '1.4.0';
+addon.version   = '1.4.1';
 addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
 
 require 'common';
@@ -481,8 +481,11 @@ local function native_view_text()
                 and (tostring(instance.remaining) .. 's') or '?');
     end
     if (#parts == 0) then parts[1] = 'none'; end
-    return ('Ashita maneuvers: %s | overload=%s'):fmt(
-        table.concat(parts, ', '), tostring(view.overloaded));
+    local normalized = view.trimmed_maneuver_count > 0
+        and (' | normalized=%d->%d'):fmt(
+            view.raw_maneuver_count, #view.maneuvers) or '';
+    return ('Ashita maneuvers: %s | overload=%s%s'):fmt(
+        table.concat(parts, ', '), tostring(view.overloaded), normalized);
 end
 
 local function game_maneuver_recast()
@@ -555,6 +558,8 @@ local function sync_visual_slots(view)
     local previous = state.slots;
     local used = {};
     local next_slots = {};
+    local full_replacement = #previous == 3 and #view.maneuvers == 3;
+    local previous_positions = {};
 
     local function find_match(instance, exact_only)
         local best_index = nil;
@@ -579,7 +584,7 @@ local function sync_visual_slots(view)
     end
 
     local changed_layout = #previous ~= #view.maneuvers;
-    if (not changed_layout) then
+    if (not changed_layout and not full_replacement) then
         for index, instance in ipairs(view.maneuvers) do
             local slot = previous[index];
             if (slot == nil or slot.name ~= instance.name
@@ -594,7 +599,10 @@ local function sync_visual_slots(view)
     for _, instance in ipairs(view.maneuvers) do
         local match_index, refreshed = find_match(instance, false);
         local slot = match_index ~= nil and previous[match_index] or nil;
-        if (slot ~= nil) then used[match_index] = true; end
+        if (slot ~= nil) then
+            used[match_index] = true;
+            previous_positions[slot] = match_index;
+        end
 
         if (slot == nil) then
             local element = by_name[string.lower(instance.name)];
@@ -629,8 +637,39 @@ local function sync_visual_slots(view)
         end
     end
 
+    if (full_replacement) then
+        -- Preserve each surviving orb's formation index and put the incoming
+        -- orb in the outgoing orb's position. Re-sorting all three by expiry
+        -- would rotate the survivors to new phase offsets and make the deploy
+        -- carousel / seal rig appear to restart on every replacement.
+        local stable_slots = {};
+        local incoming_slots = {};
+        for _, slot in ipairs(next_slots) do
+            local previous_index = previous_positions[slot];
+            if (previous_index ~= nil) then
+                stable_slots[previous_index] = slot;
+            else
+                table.insert(incoming_slots, slot);
+            end
+        end
+
+        local incoming_index = 1;
+        for index = 1, #previous do
+            if (stable_slots[index] == nil) then
+                stable_slots[index] = incoming_slots[incoming_index];
+                incoming_index = incoming_index + 1;
+            end
+        end
+        next_slots = stable_slots;
+    end
+
     for index, slot in ipairs(previous) do
-        if (not used[index]) then fade_slot(slot, now); end
+        -- A max-cap replacement already blooms the incoming orb. Keeping the
+        -- outgoing orb in the departure list would momentarily draw a fourth.
+        -- True reductions (including attachment consumption) still dissolve.
+        if (not used[index] and not full_replacement) then
+            fade_slot(slot, now);
+        end
     end
     state.slots = next_slots;
     if (state.pending_confirmation ~= nil
