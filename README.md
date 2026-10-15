@@ -1,8 +1,8 @@
 # Arcane Automata
 
 Arcane Automata is a visual-only Ashita v4 addon for HorizonXI. It renders the
-Puppetmaster's active maneuvers as elemental orbs above the local character,
-inspired by Invoker's orbiting elements in Dota 2.
+local character's active Puppetmaster maneuvers as elemental orbs when PUP is
+either the main job or subjob, inspired by Invoker's orbiting elements in Dota 2.
 
 The addon does not use abilities, automate actions, or send gameplay commands.
 
@@ -182,13 +182,15 @@ colors only the lattice; `overload` previews the separate red failure state.
 
 - Buffs 300-307 and their paired per-instance timers are read directly from
   Ashita's current `GetBuffs()` / `GetStatusTimers()` arrays every render frame.
+  Buff membership remains authoritative if the optional timer read fails;
+  affected rings become approximate until native timers recover.
 - Action packet IDs 141-148 drive burden updates and confirmation effects, but
   never create, remove, refresh, or expire maneuver state.
 - Each active instance gets its own orb, including duplicate maneuvers.
 - At three active maneuvers, native timer changes identify replacements and
-  same-element refreshes without reconstructing an activation queue. Ashita's
-  transient four-buff replacement frame is normalized immediately by dropping
-  the earliest-expiring outgoing instance.
+  same-element refreshes without reconstructing an activation queue. AA holds
+  its last valid frame through Ashita's transient four-buff replacement view;
+  it never guesses which still-active buff should be discarded.
 - Maneuvers found on load receive their current native timers immediately.
 - Economizer, Flame Holder, Overload, and other consumers need no special-case
   state changes; AA reflects the next Ashita buff snapshot.
@@ -249,7 +251,11 @@ colors only the lattice; `overload` previews the separate red failure state.
   lost. A full three-maneuver replacement suppresses the outgoing dissolve so
   the display never shows four orbs. The incoming orb inherits the outgoing
   orb's formation position, preserving the continuous deploy orbit and seal
-  phase. As the formation size changes, surviving orbs glide into new slots.
+  phase. A brief two-buff native update is coalesced with the confirmed incoming
+  maneuver, while persistent removals still appear within 50 milliseconds. As
+  the formation size changes, surviving orbs glide into new slots using
+  character-relative offsets so camera or engagement motion cannot pin an orb
+  to an old screen coordinate.
   `/aa transitions off` restores immediate appearance and removal.
 - When the automaton's entity enters its deployed combat state, `/aa deployfx on`
   tightens the formation by eight percent, slightly compresses its height, and
@@ -300,9 +306,9 @@ colors only the lattice; `overload` previews the separate red failure state.
   anchor each used element normally. For
   non-Dark Maneuvers, gain prediction compares
   the master's live base-plus-gear stat with the automaton's exact
-  base-plus-additional stat from PUP packet `0x44`. The pair is snapshotted on
-  the outgoing Maneuver request so a fast aftercast swap does not contaminate
-  the prediction.
+  base-plus-additional stat from main- or subjob-PUP packet `0x44`. The pair is
+  snapshotted on the outgoing Maneuver request so a fast aftercast swap does
+  not contaminate the prediction.
 - Horizon's private-fork constants are configurable in game. Use
   `/aa burden threshold 5` only if you are wearing Puppetry Dastanas and Horizon
   implements its +5 threshold; otherwise leave it at the default `0`. Enable

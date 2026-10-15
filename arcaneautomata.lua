@@ -1,7 +1,7 @@
 addon.name      = 'arcaneautomata';
 addon.author    = 'Koruru';
-addon.version   = '1.4.1';
-addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers.';
+addon.version   = '1.4.4';
+addon.desc      = 'Arcane elemental automata for Puppetmaster maneuvers, including PUP subjobs.';
 
 require 'common';
 
@@ -26,6 +26,9 @@ local MANEUVER_RESOURCE_OFFSET = 512;
 local MANEUVER_RECAST_SECONDS = 10;
 local MANEUVER_SYNC_TIMEOUT = 2.5;
 local MANEUVER_ABORT_TIMEOUT = 5.0;
+local NATIVE_REDUCTION_SETTLE_SECONDS = 0.05;
+local CONFIRMED_REPLACEMENT_HOLD_SECONDS = 0.35;
+local MAX_MANEUVER_SLOTS = 3;
 local ORIGIN_WORLD_LIFT = 0.10;
 local TAU = math.pi * 2;
 local TRANSITION_SECONDS = 0.28;
@@ -173,6 +176,7 @@ local state = {
     recast_was_active = false,
     recast_ready_at = -10,
     pending_confirmation = nil,
+    reduction_seen_at = nil,
     was_pup = false,
     was_alive = false,
     was_zoning = false,
@@ -338,6 +342,7 @@ local function clear_slots()
     state.overload_flash = nil;
     state.confirmation_flash = nil;
     state.pending_confirmation = nil;
+    state.reduction_seen_at = nil;
     state.recast_was_active = false;
     state.recast_ready_at = -10;
     state.anchor_x = nil;
@@ -443,7 +448,8 @@ local function get_player_state()
         return false, false, true;
     end
 
-    local is_pup = player:GetMainJob() == PUP_JOB_ID;
+    local is_pup = player:GetMainJob() == PUP_JOB_ID
+        or player:GetSubJob() == PUP_JOB_ID;
     local alive = (entity.HPPercent or 0) > 0;
     local zoning = player:GetIsZoning() ~= 0;
     local engaged = entity.Status == 1;
@@ -481,11 +487,8 @@ local function native_view_text()
                 and (tostring(instance.remaining) .. 's') or '?');
     end
     if (#parts == 0) then parts[1] = 'none'; end
-    local normalized = view.trimmed_maneuver_count > 0
-        and (' | normalized=%d->%d'):fmt(
-            view.raw_maneuver_count, #view.maneuvers) or '';
-    return ('Ashita maneuvers: %s | overload=%s%s'):fmt(
-        table.concat(parts, ', '), tostring(view.overloaded), normalized);
+    return ('Ashita maneuvers: %s | overload=%s'):fmt(
+        table.concat(parts, ', '), tostring(view.overloaded));
 end
 
 local function game_maneuver_recast()
@@ -530,9 +533,9 @@ local function begin_layout_transition(now)
     end
     now = now or clock_seconds();
     for _, slot in ipairs(state.slots) do
-        if (slot.last_x ~= nil and slot.last_y ~= nil) then
-            slot.layout_from_x = slot.last_x;
-            slot.layout_from_y = slot.last_y;
+        if (slot.last_offset_x ~= nil and slot.last_offset_y ~= nil) then
+            slot.layout_from_offset_x = slot.last_offset_x;
+            slot.layout_from_offset_y = slot.last_offset_y;
             slot.layout_from_depth = slot.last_depth or 0;
             slot.layout_started = now;
         end
@@ -556,9 +559,49 @@ end
 local function sync_visual_slots(view)
     local now = view.read_at or clock_seconds();
     local previous = state.slots;
+
+    -- An unavailable buff read is not an authoritative empty set. Preserve the
+    -- current presentation and let the next successful native read reconcile
+    -- it; timer-only failures still arrive with full approximate membership.
+    if (view.error ~= nil) then
+        return;
+    end
+
+    -- Never infer which member of Ashita's transient four-entry replacement
+    -- snapshot is stale. Buff and timer indexes can settle in different frames,
+    -- so an expiry-based guess can hide a maneuver that is still active. Keep
+    -- the last valid presentation until Ashita publishes its next valid set.
+    if (#view.maneuvers > MAX_MANEUVER_SLOTS) then
+        return;
+    end
+
+    -- Ashita can occasionally clear the outgoing buff before publishing the
+    -- incoming buff. Coalesce that two-entry intermediate view so a confirmed
+    -- max-cap replacement remains one atomic visual update. The generic
+    -- one-frame settle also covers the rare reverse packet/memory ordering;
+    -- real attachment removals are delayed by at most 50 ms.
+    if (#previous == MAX_MANEUVER_SLOTS
+        and #view.maneuvers < MAX_MANEUVER_SLOTS) then
+        if (state.reduction_seen_at == nil) then
+            state.reduction_seen_at = now;
+        end
+        local pending = state.pending_confirmation;
+        local confirmed_replacement = pending ~= nil
+            and now - pending.seen <= MANEUVER_SYNC_TIMEOUT;
+        local settle = confirmed_replacement
+            and CONFIRMED_REPLACEMENT_HOLD_SECONDS
+            or NATIVE_REDUCTION_SETTLE_SECONDS;
+        if (now - state.reduction_seen_at < settle) then
+            return;
+        end
+    else
+        state.reduction_seen_at = nil;
+    end
+
     local used = {};
     local next_slots = {};
-    local full_replacement = #previous == 3 and #view.maneuvers == 3;
+    local full_replacement = #previous == MAX_MANEUVER_SLOTS
+        and #view.maneuvers == MAX_MANEUVER_SLOTS;
     local previous_positions = {};
 
     local function find_match(instance, exact_only)
@@ -584,16 +627,6 @@ local function sync_visual_slots(view)
     end
 
     local changed_layout = #previous ~= #view.maneuvers;
-    if (not changed_layout and not full_replacement) then
-        for index, instance in ipairs(view.maneuvers) do
-            local slot = previous[index];
-            if (slot == nil or slot.name ~= instance.name
-                or slot.source_raw_timer ~= instance.raw_timer) then
-                changed_layout = true;
-                break;
-            end
-        end
-    end
     if (changed_layout) then begin_layout_transition(now); end
 
     for _, instance in ipairs(view.maneuvers) do
@@ -601,7 +634,7 @@ local function sync_visual_slots(view)
         local slot = match_index ~= nil and previous[match_index] or nil;
         if (slot ~= nil) then
             used[match_index] = true;
-            previous_positions[slot] = match_index;
+            previous_positions[slot] = slot.formation_index or match_index;
         end
 
         if (slot == nil) then
@@ -637,31 +670,43 @@ local function sync_visual_slots(view)
         end
     end
 
-    if (full_replacement) then
-        -- Preserve each surviving orb's formation index and put the incoming
-        -- orb in the outgoing orb's position. Re-sorting all three by expiry
-        -- would rotate the survivors to new phase offsets and make the deploy
-        -- carousel / seal rig appear to restart on every replacement.
-        local stable_slots = {};
-        local incoming_slots = {};
-        for _, slot in ipairs(next_slots) do
-            local previous_index = previous_positions[slot];
-            if (previous_index ~= nil) then
-                stable_slots[previous_index] = slot;
-            else
-                table.insert(incoming_slots, slot);
-            end
+    -- Formation identities survive even if packet/memory ordering exposes a
+    -- genuine two-entry frame. New orbs claim the vacant identity, so the
+    -- final three-orb order cannot change when the third entry arrives.
+    local occupied_positions = {};
+    local incoming_slots = {};
+    for _, slot in ipairs(next_slots) do
+        local position = previous_positions[slot] or slot.formation_index;
+        if (position ~= nil and position >= 1
+            and position <= MAX_MANEUVER_SLOTS
+            and not occupied_positions[position]) then
+            slot.formation_index = position;
+            occupied_positions[position] = true;
+        else
+            table.insert(incoming_slots, slot);
         end
-
-        local incoming_index = 1;
-        for index = 1, #previous do
-            if (stable_slots[index] == nil) then
-                stable_slots[index] = incoming_slots[incoming_index];
-                incoming_index = incoming_index + 1;
-            end
-        end
-        next_slots = stable_slots;
     end
+
+    local next_position = 1;
+    for _, slot in ipairs(incoming_slots) do
+        while (occupied_positions[next_position]) do
+            next_position = next_position + 1;
+        end
+        slot.formation_index = next_position;
+        occupied_positions[next_position] = true;
+
+        -- If a short intermediate reduction was rendered, retire its fading
+        -- orb as soon as the replacement reclaims that formation position.
+        for index = #state.fading_slots, 1, -1 do
+            if (state.fading_slots[index].formation_index == next_position) then
+                table.remove(state.fading_slots, index);
+            end
+        end
+    end
+
+    table.sort(next_slots, function(left, right)
+        return (left.formation_index or 0) < (right.formation_index or 0);
+    end);
 
     for index, slot in ipairs(previous) do
         -- A max-cap replacement already blooms the incoming orb. Keeping the
@@ -1994,23 +2039,26 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
         -- their previous rendered positions instead of snapping them to their
         -- newly assigned crown/orbit slots.
         if (state.settings.transitions and slot.layout_started ~= nil
-            and slot.layout_from_x ~= nil and slot.layout_from_y ~= nil) then
+            and slot.layout_from_offset_x ~= nil
+            and slot.layout_from_offset_y ~= nil) then
             local progress = clamp(
                 (now - slot.layout_started) / TRANSITION_SECONDS, 0, 1);
             if (progress < 1) then
                 local blend = progress * progress * (3 - 2 * progress);
-                x = slot.layout_from_x * (1 - blend) + x * blend;
-                y = slot.layout_from_y * (1 - blend) + y * blend;
+                local from_x = anchor_x + slot.layout_from_offset_x;
+                local from_y = anchor_y + slot.layout_from_offset_y;
+                x = from_x * (1 - blend) + x * blend;
+                y = from_y * (1 - blend) + y * blend;
                 depth = slot.layout_from_depth * (1 - blend) + depth * blend;
             else
-                slot.layout_from_x = nil;
-                slot.layout_from_y = nil;
+                slot.layout_from_offset_x = nil;
+                slot.layout_from_offset_y = nil;
                 slot.layout_from_depth = nil;
                 slot.layout_started = nil;
             end
         elseif (not state.settings.transitions) then
-            slot.layout_from_x = nil;
-            slot.layout_from_y = nil;
+            slot.layout_from_offset_x = nil;
+            slot.layout_from_offset_y = nil;
             slot.layout_from_depth = nil;
             slot.layout_started = nil;
         end
@@ -2058,6 +2106,7 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
         };
         table.insert(items, item);
         slot.last_x, slot.last_y = x, y;
+        slot.last_offset_x, slot.last_offset_y = x - anchor_x, y - anchor_y;
         slot.last_depth = depth;
         slot.last_depth_scale = base_depth_scale;
         slot.last_alpha = base_alpha;
@@ -2070,14 +2119,18 @@ local function build_render_items(anchor_x, anchor_y, now, overloaded, focus_ble
     for index = #state.fading_slots, 1, -1 do
         local slot = state.fading_slots[index];
         local progress = (now - slot.removed_at) / TRANSITION_SECONDS;
-        if (progress >= 1 or slot.last_x == nil or slot.last_y == nil) then
+        if (progress >= 1
+            or (slot.last_offset_x == nil and slot.last_x == nil)
+            or (slot.last_offset_y == nil and slot.last_y == nil)) then
             table.remove(state.fading_slots, index);
         else
             local fade = 1 - clamp(progress, 0, 1);
             table.insert(items, {
                 slot = slot,
-                x = slot.last_x,
-                y = slot.last_y,
+                x = slot.last_offset_x ~= nil
+                    and (anchor_x + slot.last_offset_x) or slot.last_x,
+                y = slot.last_offset_y ~= nil
+                    and (anchor_y + slot.last_offset_y) or slot.last_y,
                 depth = slot.last_depth or 0,
                 depth_scale = (slot.last_depth_scale or 1) * (0.82 + fade * 0.18),
                 alpha = (slot.last_alpha or 0.8) * fade,
@@ -2535,7 +2588,7 @@ local function draw_deploy_seals(draw, items, focus_blend, now)
     end
 end
 
-local function keep_items_in_safe_area(items, viewport)
+local function keep_items_in_safe_area(items, viewport, anchor_x, anchor_y)
     if (not state.settings.safearea or viewport == nil or #items == 0) then
         return;
     end
@@ -2584,6 +2637,8 @@ local function keep_items_in_safe_area(items, viewport)
     for _, item in ipairs(items) do
         if (item.slot ~= nil and not item.departing) then
             item.slot.last_x, item.slot.last_y = item.x, item.y;
+            item.slot.last_offset_x = item.x - anchor_x;
+            item.slot.last_offset_y = item.y - anchor_y;
         end
     end
 end
@@ -2668,7 +2723,7 @@ local function render()
             next_expiry_item.expiry_priority = reveal;
         end
     end
-    keep_items_in_safe_area(items, viewport);
+    keep_items_in_safe_area(items, viewport, anchor_x, anchor_y);
     if (state.settings.deploy_style == 'chevrons') then
         draw_deploy_chevrons(draw, items, focus_blend, now);
     else

@@ -51,20 +51,35 @@ equal(initial.oldest.remaining, 42, 'oldest remaining');
 equal(#initial.maneuvers, 3, 'initial total');
 
 -- Ashita can briefly publish the incoming fourth maneuver before clearing the
--- outgoing oldest slot. The reader must expose the post-replacement set in the
--- same frame instead of allowing consumers to render or plan around four.
+-- outgoing slot. The stateless reader must not guess which entry is stale:
+-- buff/timer reindexing can make an earliest-expiry heuristic discard a valid
+-- maneuver. Presentation consumers coalesce this transient view instead.
 local replacement = view({
     { 2, 300, 12 }, -- outgoing Fire
     { 5, 301, 31 }, -- Ice
     { 8, 302, 47 }, -- Wind
     { 12, 303, 60 }, -- incoming Earth
 });
-equal(replacement.raw_maneuver_count, 4, 'replacement raw total');
-equal(replacement.trimmed_maneuver_count, 1, 'replacement trimmed total');
-equal(#replacement.maneuvers, 3, 'replacement active total');
-equal(replacement.counts.Fire, nil, 'replacement removed oldest');
+equal(#replacement.maneuvers, 4, 'replacement raw total');
+equal(replacement.counts.Fire, 1, 'replacement retained outgoing snapshot');
 equal(replacement.counts.Earth, 1, 'replacement retained incoming');
-equal(replacement.oldest.name, 'Ice', 'replacement next expiry');
+equal(replacement.oldest.name, 'Fire', 'replacement raw oldest');
+
+-- Buff membership remains authoritative when the optional timer array is not
+-- available; instances simply become approximate until timers recover.
+local untimed_buffs = arrays({
+    { 4, 305, 40 }, -- Water
+    { 7, 306, 52 }, -- Light
+});
+local untimed = maneuverview.from_arrays(untimed_buffs, nil, {
+    now = now,
+    utcstamp = utc,
+});
+equal(#untimed.maneuvers, 2, 'untimed membership total');
+equal(untimed.counts.Water, 1, 'untimed Water membership');
+equal(untimed.counts.Light, 1, 'untimed Light membership');
+equal(untimed.timer_available, false, 'untimed timer availability');
+equal(untimed.maneuvers[1].approximate, true, 'untimed approximation');
 
 -- Economizer behavior requires no action-specific mutation: Ashita's next
 -- snapshot simply contains no Dark instances.

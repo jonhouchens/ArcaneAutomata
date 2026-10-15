@@ -1,5 +1,5 @@
 --[[
-pupstats.lua (v1.1) -- shared Puppetmaster burden-stat provider for Ashita v4
+pupstats.lua (v1.2) -- shared Puppetmaster burden-stat provider for Ashita v4
 
 The server's incoming 0x44 PUP packet contains the automaton's base and
 additional STR/DEX/VIT/AGI/INT/MND/CHR at offsets 0x80..0x9A.  Ashita exposes
@@ -21,7 +21,7 @@ its own fixed rule and therefore has no associated stat.
 ]]
 
 local lib = {}
-lib.VERSION = '1.1'
+lib.VERSION = '1.2'
 
 local PUP_JOB_ID = 18
 local ACTION_PACKET = 0x01A
@@ -117,13 +117,15 @@ function Provider:clear()
     self.last_context = {}
 end
 
--- Parses a main-job PUP 0x44. Returns true only when a complete stat block was
--- accepted. The packet values are exactly what the FFXI client displays.
+-- Parses a main- or subjob-PUP 0x44. Returns true only when a complete stat
+-- block was accepted. The packet values are exactly what the client displays.
 function Provider:on_job_info(data)
     if data == nil or #data < 0x9C then return false end
     local job = data:byte(0x04 + 1)
     local is_subjob = data:byte(0x05 + 1)
-    if job ~= PUP_JOB_ID or is_subjob ~= 0 then return false end
+    if job ~= PUP_JOB_ID or (is_subjob ~= 0 and is_subjob ~= 1) then
+        return false
+    end
 
     local base = {}
     local additional = {}
@@ -182,7 +184,7 @@ function Provider:_attachment_name(slot)
     return name
 end
 
--- Attachment IDs live in the same main-job PUP 0x44 as the stat block. Names
+-- Attachment IDs live in the same PUP 0x44 as the stat block. Names
 -- are resolved lazily so the pure parser remains usable in tests and during
 -- early load, before Ashita's resource manager is ready.
 function Provider:has_attachment(wanted_name)

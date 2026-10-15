@@ -1,5 +1,5 @@
 --[[
-burdenmodel.lua (v2.7) — standalone PUP burden/overload library for Ashita v4
+burdenmodel.lua (v2.8) — standalone PUP burden/overload library for Ashita v4
 Install: Ashita/addons/libs/burdenmodel.lua
 Usage from any addon:
 
@@ -46,6 +46,7 @@ HORIZON MODEL (observed unless explicitly marked as an LSB prior)
   * 8 gauges (uint8 0..255), element index 0..7:
       0=Fire 1=Ice 2=Wind 3=Earth 4=Thunder 5=Water 6=Light 7=Dark
   * Activate: fresh entity; every gauge = 30. Nothing persists past Deactivate.
+  * Deus Ex Automata: every gauge starts at an estimated 100 (2026-09-16 log).
   * Decay each 3s server-global status tick: 1 burden normally.
       Heatsink: total decay 1/2/3/4 by active WATER maneuvers (0..3).
       Zero through two Water Maneuvers were measured directly; three is the
@@ -78,7 +79,7 @@ UNSUPPORTED / OUT OF SCOPE
 ]]
 
 local lib = {}
-lib.VERSION = '2.7'
+lib.VERSION = '2.8'
 
 --------------------------------------------------------------------------
 -- constants (exported for other addons)
@@ -95,6 +96,7 @@ lib.ELEMENT_NAME = {
 
 lib.ABILITY = {
     ACTIVATE       = 136,
+    DEUS_EX_AUTOMATA = 310,
     DEACTIVATE     = 139,
     MANEUVER_FIRST = 141,   -- Fire Maneuver
     MANEUVER_LAST  = 148,   -- Dark Maneuver (element = id - 141)
@@ -160,6 +162,10 @@ end
 
 local TICK_SECONDS   = 3
 local SPAWN_BURDEN   = 30
+-- Horizon 2026-09-16: Deus at 10:48:03, Dark at 10:48:19 reports 85%.
+-- Consistent with 100 - 5 decay + 15 gain - 30 threshold + 5.
+-- Threshold gear/server tick phase remain unverified; keep this estimated.
+local DEUS_EX_BURDEN = 100
 local BASE_THRESHOLD = 30
 local GAUGE_MAX      = 255
 local HEATSINK_EXTRA_DECAY = { [0] = 0, [1] = 1, [2] = 2, [3] = 3 }
@@ -373,19 +379,28 @@ function Model:estimated_gain(elementIdx, stat_diff_override)
     return gain
 end
 
--- Activate landed: fresh entity, all gauges 30 (exact on Horizon).
-function Model:on_activate()
+-- Summon landed: replace all gauges and restart the local decay clock.
+function Model:_on_summon(seed, quality, event)
     for e = 0, 7 do
-        self.gauge[e]   = SPAWN_BURDEN
-        self.quality[e] = lib.QUALITY.EXACT
+        self.gauge[e]   = seed
+        self.quality[e] = quality
     end
     self.active          = true
     self.fire_maneuvers  = 0
     self.water_maneuvers = 0
     self.last_tick       = self.now()
-    self:_emit_telemetry('activate')
+    self._pet_missing_since = nil
+    self:_emit_telemetry(event)
     -- NOTE: overload state deliberately untouched; Overload lives on the
     -- master, not the pet.
+end
+
+function Model:on_activate()
+    self:_on_summon(SPAWN_BURDEN, lib.QUALITY.EXACT, 'activate')
+end
+
+function Model:on_deus_ex_automata()
+    self:_on_summon(DEUS_EX_BURDEN, lib.QUALITY.ESTIMATE, 'deus_ex_automata')
 end
 
 -- Library loaded while the automaton is already out. Consumers may explicitly
@@ -740,6 +755,8 @@ function lib.attach(cfg)
         })
         if aid == lib.ABILITY.ACTIVATE then
             model:on_activate()
+        elseif aid == lib.ABILITY.DEUS_EX_AUTOMATA then
+            model:on_deus_ex_automata()
         elseif aid == lib.ABILITY.DEACTIVATE then
             model:on_deactivate()
         elseif aid >= lib.ABILITY.MANEUVER_FIRST and aid <= lib.ABILITY.MANEUVER_LAST then
